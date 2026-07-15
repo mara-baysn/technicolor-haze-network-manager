@@ -328,6 +328,20 @@ mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 // Both coexist: push is the primary path, pull is for ad-hoc debugging
 ```
 
+**trail-boss capacity metrics** (critical for growth planning):
+
+```
+trail_boss_fd_used                    # current open file descriptors
+trail_boss_fd_limit                   # ulimit -n (max available)
+trail_boss_fd_utilization_ratio       # used/limit — alert at 80%
+trail_boss_active_agent_streams       # persistent bidi streams to DPU agents
+trail_boss_push_inflight_total        # PushStageConfig messages awaiting StageAck
+trail_boss_push_fan_out_duration_seconds  # histogram: time to push to all affected DPUs
+trail_boss_compilation_duration_seconds   # histogram: intent → per-DPU config
+```
+
+Alert thresholds: `fd_utilization_ratio > 0.8` fires a warning (approaching limit). `active_agent_streams` compared against fleet inventory detects DPU disconnections.
+
 ### Domain Purity
 
 `internal/domain/` contains ONLY:
@@ -677,7 +691,9 @@ Upstream Intent (per-tenant)          trail-boss Compilation          Per-DPU De
 
 **Service availability awareness:** trail-hand reports its registered sub-agents (capabilities) to trail-boss during session establishment. trail-boss only emits desired state for pipeline stages that have a running sub-agent on that DPU. If trail-pen is not yet deployed, trail-boss does not emit Security Group entries for that DPU's pipeline stage 3.
 
-**Revision tracking:** Each compilation produces a monotonically increasing `config_revision` per (dpu_id, stage). trail-hand uses this to detect staleness: if it polls and receives a revision it already applied, no work is needed.
+**Generation tracking:** Each compilation produces a monotonically increasing `generation` per (dpu_id, vni, stage) tuple. trail-hand rejects any push with `generation <= current` (prevents rollback from stale/replayed messages). Full-replace semantics: each push contains the COMPLETE desired state for that tuple — no partial updates, no ordering dependencies between pushes.
+
+**Fan-out model:** When upstream pushes a VPC-wide SG change affecting 50 DPUs, trail-boss compiles the per-DPU config and pushes to all 50 agent streams concurrently. Wall-clock convergence: ~17ms (5ms compile + 2ms push + 10ms eSwitch program). The 60-second SLO is trivially met.
 
 ---
 
@@ -691,9 +707,21 @@ NATS replaces Valkey entirely. Each trail-boss instance embeds a NATS server; th
 
 Both artifacts use the same binary with identical config. The K8s variant uses a Kubernetes Deployment with embedded NATS forming a cluster via headless Service DNS. The systemd variant uses static seed addresses. The HA mechanism (embedded NATS + epoch fencing) is deployment-model agnostic.
 
-**Communication model:** trail-boss NEVER pushes to DPU agents. trail-hand (and sub-agents via trail-hand) always PULL changes from trail-boss and report state back. trail-hand maintains a persistent gRPC bidi stream to trail-boss (agent dials out). The stream carries:
-- **Downstream (boss → hand):** desired-state responses to polls, configuration revision notifications
-- **Upstream (hand → boss):** actual-state reports, health heartbeats, capability registration
+**Communication model:** trail-hand maintains a persistent gRPC bidi stream to trail-boss (agent dials out — no inbound connectivity to DPU). trail-boss pushes compiled config over this established stream. The data flows:
+
+```
+Upstream (8 services) ──push──► trail-boss ──push_over_bidi──► trail-hand ──push──► sub-agents
+                                             ◄──ack/status──    ◄──status──
+```
+
+- **Downstream (boss → hand):** `PushStageConfig` (compiled per-DPU desired state), `FlushStage`, `RecoveryGateAdvance`, `HeartbeatAck`
+- **Upstream (hand → boss):** `AgentHello`, `FullActualStateReport`, `StageAck`/`StageNack`, `Heartbeat`, `FlowTableAlert`
+
+Agent-side safety controls:
+- **Circuit breaker:** reject if >N config changes per time window (prevents fleet-wide poisoning from compromised boss)
+- **Rate limiting:** max 5 config applications per 10-second window per pipeline stage
+- **Validation:** verify epoch, generation monotonicity, and VNI ownership before applying any pushed config
+- **gRPC flow control:** agent sizes receive window (256KB) to bound kernel buffer accumulation during GC pauses
 
 NATS is used for inter-boss coordination (session ownership, broadcast) — NOT for boss-to-agent communication.
 
@@ -747,7 +775,7 @@ NATS is used for inter-boss coordination (session ownership, broadcast) — NOT 
 
 ### Epoch Fencing Protocol (trail-hand validation)
 
-Every command from trail-boss to trail-hand carries the session epoch in a `CommandEnvelope` protobuf wrapper. trail-hand enforces monotonic epoch ordering and rejects stale commands.
+Every message from trail-boss to trail-hand on the bidi stream carries the session epoch in a `CommandEnvelope` protobuf wrapper. trail-hand enforces monotonic epoch ordering and rejects stale pushes.
 
 **Rules:**
 
@@ -759,15 +787,27 @@ Every command from trail-boss to trail-hand carries the session epoch in a `Comm
 **Proto definition:**
 
 ```protobuf
+// Wraps all boss→hand messages with epoch fencing
 message CommandEnvelope {
   uint64 epoch = 1;
-  google.protobuf.Timestamp issued_at = 2;
+  uint64 boot_epoch = 2;       // must match agent's NV-stored boot_epoch
+  google.protobuf.Timestamp issued_at = 3;
   oneof payload {
-    ApplyFlowRules apply_flow_rules = 10;
-    RevokeFlowRules revoke_flow_rules = 11;
-    ConfigUpdate config_update = 12;
-    LeaseRenew lease_renew = 13;
+    PushStageConfig push_stage_config = 10;
+    FlushStage flush_stage = 11;
+    ProgramSessionBatch program_session_batch = 12;
+    RecoveryGateAdvance recovery_gate_advance = 13;
+    HeartbeatAck heartbeat_ack = 14;
+    LeaseRenew lease_renew = 15;
   }
+}
+
+message PushStageConfig {
+  string dpu_id = 1;
+  string vni = 2;
+  uint32 pipeline_stage = 3;
+  uint64 generation = 4;       // monotonic per (dpu_id, vni, stage)
+  bytes compiled_config = 5;   // stage-specific protobuf payload
 }
 
 message LeaseRenew {
@@ -780,8 +820,11 @@ message CommandResponse {
   enum Status {
     OK = 0;
     EPOCH_STALE = 1;
-    UNOWNED = 2;
-    INTERNAL_ERROR = 3;
+    BOOT_EPOCH_MISMATCH = 2;
+    UNOWNED = 3;
+    GENERATION_STALE = 4;
+    RATE_LIMITED = 5;
+    INTERNAL_ERROR = 6;
   }
   Status status = 2;
   string detail = 3;
@@ -806,16 +849,37 @@ Boss-A          trail-hand           Boss-B (new leader)
   │                 │ → state = OWNED      │
   │                 │──── OK ─────────────►│
   │                 │                      │
-  │                 │◄── ApplyFlowRules(epoch=8)
+  │                 │◄── PushStageConfig(epoch=8)
   │                 │──── OK ─────────────►│
   │                 │                      │
-  │── ApplyFlowRules(epoch=7) ──►│         │
+  │── PushStageConfig(epoch=7) ──►│        │
   │                 │ epoch 7 < 8 → REJECT │
   │◄── EPOCH_STALE ─┤                      │
   │                 │                      │
 ```
 
 Boss-A's GC pause causes it to miss the heartbeat window. trail-hand revokes ownership after 30s, Boss-B wins leader election and registers epoch=8. When Boss-A recovers and sends stale epoch=7 command, trail-hand rejects it deterministically.
+
+### trail-boss Capacity (persistent bidi streams)
+
+Each DPU connection costs ~200KB on trail-boss (TCP socket + HTTP/2 state + goroutines + per-DPU state cache). Connections are cheap; burst fan-out is the bottleneck.
+
+| DPUs | Memory | Goroutines | Burst Push (50KB to all, 4 cores) |
+|------|--------|------------|-----------------------------------|
+| 200 | 340 MB | 1,050 | 25ms |
+| 500 | 400 MB | 2,550 | 62ms |
+| 1,000 | 500 MB | 5,050 | 125ms |
+| 2,000 | 700 MB | 10,050 | 250ms |
+| 5,000 | 1,300 MB | 25,050 | 625ms |
+
+**Practical ceilings:**
+- 4 cores, 16GB pod: **2,000 DPUs** comfortable, 4,000 stretched
+- 8 cores, 32GB pod: **5,000 DPUs** comfortable, 8,000 stretched
+- Beyond 5,000: shard by tenant group or rack affinity (two 4c pods > one 8c pod due to halved blast radius)
+
+**Bottleneck ordering:** CPU burst > Network burst > GC pressure > Memory. File descriptors never limit (set `ulimit -n 65536`).
+
+**v1.0 target (200 DPUs):** 340MB RAM, 0.1 CPU core steady-state. 10x headroom before any scaling concern.
 
 **Config**:
 ```toml
@@ -1746,7 +1810,7 @@ Checklist for making this plan executable by coding agents without human clarifi
 ### Architectural Decisions (resolved)
 
 - [x] DECISION: Deployment model — trail-boss produces 2 artifacts: bare-metal systemd (.deb/.rpm) + Dockerfile for K8s. Both use same binary.
-- [x] DECISION: Wire protocol — gRPC bidi stream (trail-hand dials out to trail-boss). NATS is inter-boss coordination only, NOT agent communication.
+- [x] DECISION: Wire protocol — gRPC bidi stream (trail-hand dials out). Boss PUSHES config over established stream. Agent pushes acks/status back. NATS is inter-boss coordination only.
 - [x] DECISION: DPU agent packaging — systemd + .deb/.rpm on DPU. No containers on DPU.
 - [x] DECISION: Compilation engine — trail-boss compiles intent per available service on each DPU (scoped by registered sub-agent capabilities).
 - [x] DECISION: Component identity — trail-boss IS the DPU Orchestrator (same system, new implementation).
