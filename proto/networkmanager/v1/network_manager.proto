@@ -1,0 +1,441 @@
+syntax = "proto3";
+package networkmanager.v1;
+
+option go_package = "github.com/mara-baysn/technicolor-haze-network-manager/gen/networkmanager/v1;networkmanagerv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================
+// Network Manager Service — Fleet Orchestration network state store
+//
+// Sits in the Fleet Orchestration layer:
+//   - Receives configuration from Shepherd (tenant network requirements)
+//   - Stores all network state: VPCs, subnets, firewall rules, NAT, routing, rate limits
+//   - Serves desired state to DPU agents (pull model)
+//   - Integrates with Inventory + Metaservice for device/host discovery
+// ============================================================
+
+service NetworkManagerService {
+  // === Called by Shepherd / API Gateway (management) ===
+
+  // Tenant network lifecycle
+  rpc CreateTenantNetwork(CreateTenantNetworkRequest) returns (CreateTenantNetworkResponse);
+  rpc DeleteTenantNetwork(DeleteTenantNetworkRequest) returns (DeleteTenantNetworkResponse);
+  rpc GetTenantNetwork(GetTenantNetworkRequest) returns (GetTenantNetworkResponse);
+  rpc ListTenantNetworks(ListTenantNetworksRequest) returns (ListTenantNetworksResponse);
+
+  // Firewall rules (per tenant)
+  rpc AddFirewallRule(AddFirewallRuleRequest) returns (AddFirewallRuleResponse);
+  rpc DeleteFirewallRule(DeleteFirewallRuleRequest) returns (DeleteFirewallRuleResponse);
+  rpc ListFirewallRules(ListFirewallRulesRequest) returns (ListFirewallRulesResponse);
+
+  // NAT configuration (per tenant)
+  rpc AddNATRule(AddNATRuleRequest) returns (AddNATRuleResponse);
+  rpc DeleteNATRule(DeleteNATRuleRequest) returns (DeleteNATRuleResponse);
+  rpc ListNATRules(ListNATRulesRequest) returns (ListNATRulesResponse);
+
+  // Rate limits (per tenant)
+  rpc SetRateLimit(SetRateLimitRequest) returns (SetRateLimitResponse);
+  rpc GetRateLimit(GetRateLimitRequest) returns (GetRateLimitResponse);
+
+  // IP allocation
+  rpc AllocatePublicIP(AllocatePublicIPRequest) returns (AllocatePublicIPResponse);
+  rpc ReleasePublicIP(ReleasePublicIPRequest) returns (ReleasePublicIPResponse);
+  rpc ListPublicIPs(ListPublicIPsRequest) returns (ListPublicIPsResponse);
+
+  // === Called by DPU Agents (pull model) ===
+
+  // Firewall agent calls this to get its desired state
+  rpc GetDPUDesiredState(GetDPUDesiredStateRequest) returns (GetDPUDesiredStateResponse);
+
+  // Agent reports back what it applied + metrics
+  rpc ReportAgentStatus(ReportAgentStatusRequest) returns (ReportAgentStatusResponse);
+
+  // === Called by DPU Orchestrator (placement) ===
+
+  // Assign tenant to a specific DPU
+  rpc AssignTenantToDPU(AssignTenantToDPURequest) returns (AssignTenantToDPUResponse);
+  rpc UnassignTenantFromDPU(UnassignTenantFromDPURequest) returns (UnassignTenantFromDPUResponse);
+  rpc GetDPUAssignments(GetDPUAssignmentsRequest) returns (GetDPUAssignmentsResponse);
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_ALLOW = 1;
+  ACTION_DENY = 2;
+}
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_TCP = 1;
+  PROTOCOL_UDP = 2;
+  PROTOCOL_ICMP = 3;
+  PROTOCOL_ANY = 4;
+}
+
+enum NATType {
+  NAT_TYPE_UNSPECIFIED = 0;
+  NAT_TYPE_SNAT = 1;
+  NAT_TYPE_DNAT = 2;
+  NAT_TYPE_FORWARD = 3;
+  NAT_TYPE_NPTV6 = 4;
+}
+
+enum NATMode {
+  NAT_MODE_UNSPECIFIED = 0;
+  NAT_MODE_STATIC = 1;
+  NAT_MODE_MASQUERADE = 2;
+}
+
+enum IpVersion {
+  IP_VERSION_UNSPECIFIED = 0;
+  IP_VERSION_4 = 1;
+  IP_VERSION_6 = 2;
+}
+
+enum AgentType {
+  AGENT_TYPE_UNSPECIFIED = 0;
+  AGENT_TYPE_FIREWALL = 1;
+  AGENT_TYPE_ROUTING = 2;
+  AGENT_TYPE_MONITORING = 3;
+}
+
+// ============================================================
+// Core resource messages
+// ============================================================
+
+message TenantNetwork {
+  string tenant_id = 1;
+  string name = 2;
+  string subnet_cidr = 3;          // e.g. "10.100.0.0/24"
+  string gateway_ip = 4;           // e.g. "10.100.0.1"
+  repeated string public_ips = 5;  // allocated public IPs
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message FirewallRule {
+  string id = 1;
+  string tenant_id = 2;
+  string src_cidr = 3;
+  string dst_cidr = 4;
+  optional uint32 src_port = 5;
+  optional uint32 dst_port = 6;
+  Protocol protocol = 7;
+  Action action = 8;
+  uint32 priority = 9;
+  IpVersion ip_version = 10;
+  google.protobuf.Timestamp created_at = 11;
+}
+
+message NATRule {
+  string id = 1;
+  string tenant_id = 2;
+  NATType type = 3;
+  string public_ip = 4;
+  optional uint32 public_port = 5;
+  string private_ip = 6;
+  optional uint32 private_port = 7;
+  string external_prefix = 8;
+  string internal_prefix = 9;
+  uint32 prefix_length = 10;
+  Protocol protocol = 11;
+  NATMode mode = 12;
+  IpVersion ip_version = 13;
+  google.protobuf.Timestamp created_at = 14;
+}
+
+message RateLimit {
+  string tenant_id = 1;
+  uint64 ingress_bytes_per_second = 2;
+  uint64 egress_bytes_per_second = 3;
+  uint64 burst_bytes = 4;
+}
+
+message PublicIPAllocation {
+  string ip = 1;
+  string tenant_id = 2;  // empty if unallocated
+  IpVersion ip_version = 3;
+  google.protobuf.Timestamp allocated_at = 4;
+}
+
+message DPUAssignment {
+  string dpu_id = 1;
+  string tenant_id = 2;
+  string in_port = 3;   // e.g. "pf0vf0"
+  string out_port = 4;  // e.g. "pf0"
+  google.protobuf.Timestamp assigned_at = 5;
+}
+
+message AgentStatus {
+  string dpu_id = 1;
+  AgentType agent_type = 2;
+  uint32 total_rules = 3;
+  uint32 hw_offloaded = 4;
+  uint64 packets_forwarded = 5;
+  uint64 packets_dropped = 6;
+  uint64 bytes_forwarded = 7;
+  uint64 bytes_dropped = 8;
+  uint64 uptime_seconds = 9;
+  string last_sync_error = 10;
+  google.protobuf.Timestamp last_sync_time = 11;
+  google.protobuf.Timestamp reported_at = 12;
+}
+
+// ============================================================
+// DPU Desired State (aggregate view for an agent)
+// ============================================================
+
+message DPUDesiredState {
+  string dpu_id = 1;
+  repeated TenantDesiredState tenants = 2;
+  uint64 version = 3;  // monotonic version for change detection
+}
+
+message TenantDesiredState {
+  string tenant_id = 1;
+  string in_port = 2;
+  string out_port = 3;
+  repeated string public_ips = 4;
+  repeated FirewallRule firewall_rules = 5;
+  repeated NATRule nat_rules = 6;
+  RateLimit rate_limit = 7;
+}
+
+// ============================================================
+// Tenant Network RPCs
+// ============================================================
+
+message CreateTenantNetworkRequest {
+  string tenant_id = 1;
+  string name = 2;
+  string subnet_cidr = 3;
+  string gateway_ip = 4;
+}
+
+message CreateTenantNetworkResponse {
+  TenantNetwork network = 1;
+}
+
+message DeleteTenantNetworkRequest {
+  string tenant_id = 1;
+}
+
+message DeleteTenantNetworkResponse {}
+
+message GetTenantNetworkRequest {
+  string tenant_id = 1;
+}
+
+message GetTenantNetworkResponse {
+  TenantNetwork network = 1;
+}
+
+message ListTenantNetworksRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListTenantNetworksResponse {
+  repeated TenantNetwork networks = 1;
+  string next_page_token = 2;
+}
+
+// ============================================================
+// Firewall Rule RPCs
+// ============================================================
+
+message AddFirewallRuleRequest {
+  string tenant_id = 1;
+  string src_cidr = 2;
+  string dst_cidr = 3;
+  optional uint32 src_port = 4;
+  optional uint32 dst_port = 5;
+  Protocol protocol = 6;
+  Action action = 7;
+  uint32 priority = 8;
+}
+
+message AddFirewallRuleResponse {
+  FirewallRule rule = 1;
+}
+
+message DeleteFirewallRuleRequest {
+  string tenant_id = 1;
+  string rule_id = 2;
+}
+
+message DeleteFirewallRuleResponse {}
+
+message ListFirewallRulesRequest {
+  string tenant_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListFirewallRulesResponse {
+  repeated FirewallRule rules = 1;
+  string next_page_token = 2;
+}
+
+// ============================================================
+// NAT Rule RPCs
+// ============================================================
+
+message AddNATRuleRequest {
+  string tenant_id = 1;
+  NATType type = 2;
+  string public_ip = 3;
+  optional uint32 public_port = 4;
+  string private_ip = 5;
+  optional uint32 private_port = 6;
+  string external_prefix = 7;
+  string internal_prefix = 8;
+  uint32 prefix_length = 9;
+  Protocol protocol = 10;
+  NATMode mode = 11;
+}
+
+message AddNATRuleResponse {
+  NATRule rule = 1;
+}
+
+message DeleteNATRuleRequest {
+  string tenant_id = 1;
+  string rule_id = 2;
+}
+
+message DeleteNATRuleResponse {}
+
+message ListNATRulesRequest {
+  string tenant_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListNATRulesResponse {
+  repeated NATRule rules = 1;
+  string next_page_token = 2;
+}
+
+// ============================================================
+// Rate Limit RPCs
+// ============================================================
+
+message SetRateLimitRequest {
+  string tenant_id = 1;
+  uint64 ingress_bytes_per_second = 2;
+  uint64 egress_bytes_per_second = 3;
+  uint64 burst_bytes = 4;
+}
+
+message SetRateLimitResponse {
+  RateLimit rate_limit = 1;
+}
+
+message GetRateLimitRequest {
+  string tenant_id = 1;
+}
+
+message GetRateLimitResponse {
+  RateLimit rate_limit = 1;
+}
+
+// ============================================================
+// IP Allocation RPCs
+// ============================================================
+
+message AllocatePublicIPRequest {
+  string tenant_id = 1;
+  IpVersion ip_version = 2;  // prefer v4 or v6
+}
+
+message AllocatePublicIPResponse {
+  PublicIPAllocation allocation = 1;
+}
+
+message ReleasePublicIPRequest {
+  string ip = 1;
+}
+
+message ReleasePublicIPResponse {}
+
+message ListPublicIPsRequest {
+  string tenant_id = 1;  // filter by tenant; empty = all
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListPublicIPsResponse {
+  repeated PublicIPAllocation allocations = 1;
+  string next_page_token = 2;
+}
+
+// ============================================================
+// DPU Desired State RPCs (pull model)
+// ============================================================
+
+message GetDPUDesiredStateRequest {
+  string dpu_id = 1;
+  uint64 last_known_version = 2;  // for conditional fetch (0 = always return)
+}
+
+message GetDPUDesiredStateResponse {
+  DPUDesiredState desired_state = 1;
+  bool unchanged = 2;  // true if last_known_version matches current
+}
+
+// ============================================================
+// Agent Status RPCs
+// ============================================================
+
+message ReportAgentStatusRequest {
+  string dpu_id = 1;
+  AgentType agent_type = 2;
+  uint32 total_rules = 3;
+  uint32 hw_offloaded = 4;
+  uint64 packets_forwarded = 5;
+  uint64 packets_dropped = 6;
+  uint64 bytes_forwarded = 7;
+  uint64 bytes_dropped = 8;
+  uint64 uptime_seconds = 9;
+  string last_sync_error = 10;
+}
+
+message ReportAgentStatusResponse {
+  google.protobuf.Timestamp acknowledged_at = 1;
+}
+
+// ============================================================
+// DPU Assignment RPCs
+// ============================================================
+
+message AssignTenantToDPURequest {
+  string tenant_id = 1;
+  string dpu_id = 2;
+  string in_port = 3;
+  string out_port = 4;
+}
+
+message AssignTenantToDPUResponse {
+  DPUAssignment assignment = 1;
+}
+
+message UnassignTenantFromDPURequest {
+  string tenant_id = 1;
+  string dpu_id = 2;
+}
+
+message UnassignTenantFromDPUResponse {}
+
+message GetDPUAssignmentsRequest {
+  string dpu_id = 1;  // get all tenants assigned to this DPU
+}
+
+message GetDPUAssignmentsResponse {
+  repeated DPUAssignment assignments = 1;
+}
