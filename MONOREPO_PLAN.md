@@ -201,12 +201,17 @@ technicolor-haze-trail/
 ├── go.mod                         ← module github.com/mara-baysn/technicolor-haze-trail
 ├── go.sum
 ├── Makefile
+├── Dockerfile                     ← trail-boss K8s container image (multi-stage, distroless)
 ├── buf.yaml                       ← Buf v2 workspace for proto/
 ├── buf.gen.yaml                   ← Codegen via buf.infra.voxel.fyi plugins
 ├── tools.go                       ← Pin protoc-gen-go, protoc-gen-connect-go
 ├── .github/
 │   └── workflows/
 │       └── ci.yml
+├── .releaserc.yaml                ← semantic-release root config
+├── release/
+│   ├── trail-boss.releaserc.yaml  ← Boss release config
+│   └── trail-dpu.releaserc.yaml   ← DPU package release config
 ├── .gitmodules
 ├── .gitignore
 └── README.md
@@ -653,9 +658,44 @@ state_file = "/var/lib/trail-boss/ipam-stub-state.json"
 
 ---
 
+## Intent Compilation (trail-boss)
+
+trail-boss is the **compilation engine**: it receives high-level intent from upstream controllers (Tenant/VPC Controller, Gateway Controller, Prism, Nexus, NAT, LB, DNS, DHCP) and compiles it into per-DPU desired state scoped to the services available on each DPU.
+
+**Compilation flow:**
+
+```
+Upstream Intent (per-tenant)          trail-boss Compilation          Per-DPU Desired State
+─────────────────────────────    →    ────────────────────────    →   ─────────────────────────
+"SG rule: allow tcp/443 from       "DPU-17 has VF pf0vf3 for       "trail-gate@DPU-17:
+ 10.0.1.0/24 for tenant-A"          tenant-A in VNI 100042"          stage=NACL, vni=100042,
+                                                                      match=10.0.1.0/24:tcp:443
+                                                                      action=ALLOW"
+```
+
+**Per-DPU scoping:** trail-boss knows which DPU hosts which tenant VFs (from trail-corral capacity reports). It compiles intent only for DPUs that have relevant VFs. A Security Group change for tenant-A only produces desired-state for DPUs hosting tenant-A's VFs — not the entire fleet.
+
+**Service availability awareness:** trail-hand reports its registered sub-agents (capabilities) to trail-boss during session establishment. trail-boss only emits desired state for pipeline stages that have a running sub-agent on that DPU. If trail-pen is not yet deployed, trail-boss does not emit Security Group entries for that DPU's pipeline stage 3.
+
+**Revision tracking:** Each compilation produces a monotonically increasing `config_revision` per (dpu_id, stage). trail-hand uses this to detect staleness: if it polls and receives a revision it already applied, no work is needed.
+
+---
+
 ## trail-boss HA (NATS embedded)
 
 NATS replaces Valkey entirely. Each trail-boss instance embeds a NATS server; they cluster automatically via route gossip. Zero external dependencies beyond PostgreSQL.
+
+**Deployment model:** trail-boss produces TWO artifacts:
+1. **Bare-metal systemd** — `.deb`/`.rpm` via nfpm for lab and non-K8s environments
+2. **Dockerfile** — for running in Kubernetes (Tier 2 management cluster) alongside other control-plane controllers
+
+Both artifacts use the same binary with identical config. The K8s variant uses a Kubernetes Deployment with embedded NATS forming a cluster via headless Service DNS. The systemd variant uses static seed addresses. The HA mechanism (embedded NATS + epoch fencing) is deployment-model agnostic.
+
+**Communication model:** trail-boss NEVER pushes to DPU agents. trail-hand (and sub-agents via trail-hand) always PULL changes from trail-boss and report state back. trail-hand maintains a persistent gRPC bidi stream to trail-boss (agent dials out). The stream carries:
+- **Downstream (boss → hand):** desired-state responses to polls, configuration revision notifications
+- **Upstream (hand → boss):** actual-state reports, health heartbeats, capability registration
+
+NATS is used for inter-boss coordination (session ownership, broadcast) — NOT for boss-to-agent communication.
 
 **Why NATS over Valkey?**
 - Embedded: single binary deploy, no sidecar
@@ -689,11 +729,11 @@ NATS replaces Valkey entirely. Each trail-boss instance embeds a NATS server; th
    trail-hand           trail-hand           trail-hand
 ```
 
-**Subject design**:
-- `trail.cmd.{dpu_id}` — routed to owning instance (only it subscribes)
-- `trail.health.{dpu_id}` — published by owning instance
-- `trail.broadcast.>` — all instances subscribe
+**Subject design** (inter-boss coordination only — NOT agent communication):
+- `trail.session.{dpu_id}` — owning instance subscribes for session ownership events
+- `trail.broadcast.>` — all instances subscribe (policy pushes, config changes)
 - `trail.events.>` — JetStream stream for audit (optional)
+- `trail.rebalance` — session redistribution on instance join/leave
 
 **JetStream KV buckets**:
 | Bucket | Replicas | TTL | Storage | Purpose |
@@ -1487,9 +1527,9 @@ Deploy arm64 package to lab DPU. Verify: trail-hand starts, registers with trail
 
 **Goal:** Production traffic validated on monorepo builds. Old repos go read-only.
 
-**Step 16. Shadow mode deployment (1+ week minimum).**
+**Step 16. Greenfield validation deployment (1+ week minimum).**
 
-Deploy trail-boss alongside existing control plane in shadow mode. Compare decisions without programming DPUs. Alert on divergence; run until zero divergence for 72+ hours.
+Deploy trail-boss (K8s or systemd) with synthetic workloads. No existing control plane to shadow against — this is greenfield. Validate: trail-boss correctly compiles intent from upstream controllers (Tenant/VPC, Gateway) into per-DPU desired state. Run synthetic tenant lifecycle scenarios (create VPC → add subnet → attach VF → apply SG → teardown) for 72+ hours under load. Assert: zero state corruption, convergence within SLO, no session ownership flapping.
 
 **Step 17. Canary rack: 5-10 DPUs on trail (1 week minimum).**
 
@@ -1696,3 +1736,31 @@ When trail-hand starts (or restarts), it discovers sub-agents by scanning `/run/
 | Interface lifecycle | herd-handler owns VF attach | trail-corral (dedicated sub-agent) | Shared dependency, needs ordering guarantees |
 | Metrics | Pull only (Prometheus scrape) | Push (OTLP) + Pull (/metrics) | Push is primary for DPU (no inbound scrape path) |
 | Proto generation | Local protoc-gen-* | buf.infra.voxel.fyi (internal BSR) | Platform standard, centralized plugin versions |
+
+---
+
+## Agentic Execution Readiness
+
+Checklist for making this plan executable by coding agents without human clarification.
+
+### Architectural Decisions (resolved)
+
+- [x] DECISION: Deployment model — trail-boss produces 2 artifacts: bare-metal systemd (.deb/.rpm) + Dockerfile for K8s. Both use same binary.
+- [x] DECISION: Wire protocol — gRPC bidi stream (trail-hand dials out to trail-boss). NATS is inter-boss coordination only, NOT agent communication.
+- [x] DECISION: DPU agent packaging — systemd + .deb/.rpm on DPU. No containers on DPU.
+- [x] DECISION: Compilation engine — trail-boss compiles intent per available service on each DPU (scoped by registered sub-agent capabilities).
+- [x] DECISION: Component identity — trail-boss IS the DPU Orchestrator (same system, new implementation).
+- [x] DECISION: Sub-agent management — trail-hand manages sub-agents via systemd on DPU. Confirmed.
+- [x] DECISION: Shadow mode — removed. Greenfield deployment (no existing control plane). Replaced with synthetic validation workload.
+- [x] DECISION: NICo integration — NICo handles DPU firmware/boot/attestation. Trail agents are installed after NICo confirms DPU is ready. NICo does NOT manage trail agent lifecycle (systemd does).
+
+### Implementation Gaps (for loop agents to resolve)
+
+- [ ] Phase 1 Step 2: filter-repo flags are non-overlapping with expected output tree verified
+- [ ] Phase 1 Step 3: go.mod merge strategy concrete (both source go.mods listed, conflict rules explicit)
+- [ ] Phase 1 Step 4: complete old-to-new import path mapping table and rewrite script provided
+- [ ] Phase 2 Step 6: for each duplicate package, winner specified with merge instructions and acceptance criteria
+- [ ] Phase 2 Step 7b: trail-boss proto service definition complete (all RPCs listed with request/response types)
+- [ ] Phase 3 Steps 11-13: each wiring step has proto messages, Go interfaces, integration test spec, and mock boundaries
+- [ ] Phase 3 Step 14: E2E broken into prioritized sub-steps with must-have vs nice-to-have
+- [ ] proto/trail/v1/agent.proto: complete message definitions for bidi session (connect, heartbeat, desired-state poll, actual-state report, recovery)
