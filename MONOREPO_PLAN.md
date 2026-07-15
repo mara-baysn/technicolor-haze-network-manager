@@ -274,16 +274,20 @@ metrics_push_interval = "15s"
 
 ### Systemd Units
 
+All DPU agents run under `trail.slice` with per-binary memory enforcement (see DPU Memory Budget section).
+
 ```ini
 [Unit]
-Description=trail-hand - DPU network agent
+Description=trail-hand - DPU network master agent
 After=network.target
+Before=trail-corral.service trail-gate.service trail-pen.service trail-path.service trail-brand.service trail-trough.service trail-latch.service
 
 [Service]
-Type=simple
+Type=notify
 User=trail
 Group=trail
 ExecStart=/usr/bin/trail-hand --config /etc/trail-hand/config.toml
+Slice=trail.slice
 Restart=always
 RestartSec=2s
 StartLimitIntervalSec=0
@@ -291,6 +295,16 @@ WorkingDirectory=/var/lib/trail-hand
 StateDirectory=trail-hand
 ConfigurationDirectory=trail-hand
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+
+# Memory enforcement
+MemoryMax=64M
+MemoryHigh=51M
+Environment=GOMEMLIMIT=64MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=4
+
+# IPC watchdog
+WatchdogSec=30s
 
 [Install]
 WantedBy=multi-user.target
@@ -319,27 +333,89 @@ mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 
 ### Testing Strategy
 
+Four test tiers enforce correctness from unit through hardware integration:
+
 ```makefile
-test:
-	go test ./... -race -timeout 90s
+# Tier 1: Fast feedback (per-commit, <60s)
+test:            go test ./... -short -count=1
+test-race:       go test ./... -short -race -count=1
+lint:            golangci-lint run ./...
+bench:           go test ./... -bench=. -benchmem -count=6 | tee bench-current.txt && \
+                 benchstat bench-baseline.txt bench-current.txt
 
-test-integration:
-	go test -tags=integration ./test/integration/ -timeout 60s
+# Tier 2: Fault injection (nightly CI, ~10min)
+test-fault:      go test ./... -tags=faultinject -timeout=10m -count=1
+test-fault-race: go test ./... -tags=faultinject -race -timeout=15m -count=1
 
-test-e2e:
-	go test -tags=e2e ./test/e2e/ -timeout 300s
+# Tier 3: Multi-process E2E (nightly CI, ~20min)
+test-multiprocess: go test ./test/e2e/... -tags=multiprocess -timeout=20m -count=1 -v
 
-coverage:
-	./scripts/coverage.sh  # 85% gate per package, skips gen/ and cmd/
+# Tier 4: Hardware integration (gates releases, arm64 only)
+test-hardware:   go test ./... -tags=hardware -race -timeout=30m -count=1
+
+# Quality gates
+coverage:        go test ./... -coverprofile=cover.out && go tool cover -func=cover.out
+mutate:          go-mutesting ./internal/subagent/reconciler/... ./internal/hand/... ./internal/netlink/...
 ```
 
-**E2E tests** (`test/e2e/`):
-- Start ALL components in-process (trail-boss, trail-hand, trail-gate, trail-corral)
-- Mock `internal/netlink/` via interface (no real DPU needed)
-- Validate full lifecycle: tenant create → interface provision → rules apply → NAT → teardown
-- Failure scenarios: sub-agent crash → trail-hand restarts it → reconcile recovers state
-- Retry scenarios: NATS disconnect → reconnect → pending ops delivered
-- Rollback scenarios: partial tc-flower apply fails → rollback to last-known-good state
+**Netlink Fault-Injection Layer**
+
+The `internal/netlink/faultinject` package is NOT a mock — it is a programmable error injector wrapping real `netlink.Handle` types. Production code accepts a `netlink.Conn` interface; the fault layer implements the same interface but injects configurable failures:
+
+| Fault Mode | Simulates | Use Case |
+|---|---|---|
+| `ENOSPC` | Hardware flow table full (4096 rules) | Validates table-full backpressure and eviction |
+| `EBUSY` | Firmware operation in progress | Tests retry/backoff logic in reconciler |
+| `ENOMEM` | Kernel memory pressure | Tests graceful degradation path |
+| Partial batch failure | N of M rules in a batch fail | Validates atomic rollback of partial applies |
+
+Configurable failure policies:
+- `FailAfterN(n int)` — first N calls succeed, then inject error
+- `RandomRate(pct float64)` — fail randomly at given percentage (e.g., 5%)
+- `LatencySpike(d time.Duration)` — inject delay before returning (e.g., 50ms)
+- `FailSequence(errs []error)` — return errors in order, then succeed
+
+Tests using fault injection are gated behind `//go:build faultinject` to avoid polluting fast unit runs.
+
+**Multi-Process E2E**
+
+The `test/e2e/` package launches trail-boss, trail-hand, and sub-agents as separate OS processes using `exec.Command`, not in-process goroutines. This validates real IPC paths:
+
+- **Real Unix sockets** — trail-hand listens on `/tmp/trail-test-<random>/hand.sock`; sub-agents connect as independent processes
+- **Real NATS clustering** — spins up a 3-node embedded NATS cluster with actual TCP ports
+- **Process isolation** — each binary runs with its own PID, memory space, and signal handling
+
+Chaos injection scenarios:
+
+| Scenario | Method | Assertion |
+|---|---|---|
+| Sub-agent crash | `SIGKILL` random sub-agent PID | trail-hand detects within 5s, respawns, state converges within 60s |
+| NATS partition | `iptables DROP` between NATS nodes (netns) | Boss detects partition, fences stale agents, reconverges after heal |
+| Boss-hand delay | `tc netem delay 5000ms` on loopback | Hand enters autonomous mode, queues updates, replays after reconnect |
+| Cascading failure | Kill 3 of 5 sub-agents simultaneously | System recovers without operator intervention within 60s SLO |
+
+Every chaos scenario asserts the **60-second convergence SLO**: after injection, the desired-state/actual-state delta must reach zero within 60 seconds.
+
+**Hardware Integration Gate**
+
+A self-hosted GitHub Actions runner on a lab BlueField-3 DPU (arm64) executes `test-hardware` nightly:
+
+- `go test -race` on native arm64 (catches alignment bugs, ARM memory model issues)
+- BF3-specific tc-flower validation: programs real eSwitch rules via netlink, verifies with `tc filter show`
+- OVS representor port verification with actual VF-rep netdevs
+- Hardware tests MUST pass before any deployment outside the lab environment
+
+**Quality Gates (Tiered)**
+
+| Gate | Threshold | Scope | Enforcement |
+|---|---|---|---|
+| Line coverage floor | 85% | All packages | Per-PR, merge-blocking |
+| Mutation testing | No surviving mutants in critical paths | `internal/subagent/reconciler`, `internal/hand`, `internal/netlink` | Nightly, blocks release |
+| Error-path coverage | Every function returning `error` has ≥ 1 error-path test | All packages | Per-PR via custom linter |
+| FSM transition coverage | Every state transition exercised, including illegal transitions | `internal/subagent/reconciler`, `internal/hand` | Per-PR, merge-blocking |
+| Benchmark regression | No metric regresses > 10% vs baseline | All `_test.go` benchmarks | Per-PR via `benchstat`, advisory warning at 5% |
+
+The 85% line coverage floor is a necessary minimum, not a quality signal. Mutation testing and error-path coverage provide the actual correctness guarantee.
 
 ---
 
@@ -408,6 +484,129 @@ which delegates to trail-corral.
 
 ---
 
+## Sub-Agent Failure Behavior
+
+All sub-agents on a DPU are supervised by trail-hand via Unix socket IPC. Failure isolation ensures that a single component crash does not tear down active tenant traffic.
+
+### trail-hand Death Behavior
+
+When trail-hand terminates (crash, OOM-kill, upgrade), sub-agents detect the loss of their IPC connection and transition independently:
+
+| Phase | Behavior |
+|-------|----------|
+| Detection | Sub-agent IPC heartbeat missed for configurable watchdog interval (default 30s) |
+| Transition | Sub-agent enters `DEGRADED` state |
+| Enforcement | Last-known rules remain programmed in hardware — existing flows continue forwarding |
+| Restriction | All new flow programming requests are refused with `UNAVAILABLE` status |
+| Recovery | On trail-hand reconnect, sub-agent sends a `FullActualStateReport` containing every rule/interface/flow it currently enforces |
+
+The fail-safe posture preserves tenant connectivity: tc-flower rules already installed in the eSwitch persist regardless of userspace process state. Sub-agents only gate *mutations*, not the datapath itself.
+
+**Reconnection protocol:**
+
+1. trail-hand opens new Unix socket connection to each sub-agent.
+2. Sub-agent replies with `FullActualStateReport` (all programmed flows, interface states, counters).
+3. trail-hand performs reconciliation: diffs reported state against desired state from trail-boss.
+4. Stale entries are removed; missing entries are programmed. Sub-agent transitions back to `READY`.
+
+### trail-corral Failure Mid-Operation
+
+trail-corral manages interface lifecycle through a per-interface state machine. Failures at any stage trigger compensating teardown rather than leaving partial state.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│              trail-corral Interface State Machine                 │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────┐    success    ┌─────────────┐    success           │
+│  │ CREATING ├──────────────►│ CONFIGURING ├──────────────┐       │
+│  └────┬─────┘              └──────┬──────┘              │       │
+│       │                           │                      ▼       │
+│       │ error                     │ error          ┌─────────┐   │
+│       │                           │                │  READY  │   │
+│       ▼                           ▼                └────┬────┘   │
+│  ┌──────────┐              ┌──────────┐                 │        │
+│  │  FAILED  │◄─────────────┤  FAILED  │                 │ delete │
+│  └────┬─────┘              └────┬─────┘                 │        │
+│       │                         │                        ▼        │
+│       │ compensate              │ compensate      ┌────────────┐  │
+│       ▼                         ▼                 │ DESTROYING │  │
+│  ┌────────────┐           ┌────────────┐          └─────┬──────┘  │
+│  │ DESTROYING │           │ DESTROYING │                │        │
+│  └────────────┘           └────────────┘                ▼        │
+│                                                    (removed)     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**State semantics:**
+
+- **CREATING** — VF representor allocated, netdev created, not yet configured.
+- **CONFIGURING** — VLAN, MAC, rate-limit, and QoS parameters being applied via netlink.
+- **READY** — Interface fully operational. Only interfaces in this state are visible to downstream sub-agents (trail-gate, trail-pen).
+- **FAILED** — Error during creation or configuration. Triggers compensating teardown before retry.
+- **DESTROYING** — Teardown in progress. Resources released in reverse order.
+
+**Gating behavior:** trail-hand will not dispatch interface references to trail-gate or trail-pen until trail-corral reports that interface has reached `READY`.
+
+### trail-boss Detection of DPU Degradation
+
+trail-boss monitors the gRPC heartbeat stream from every trail-hand instance:
+
+- Heartbeat interval: 3s (configurable via `trail-boss.toml`)
+- Miss threshold: 3 consecutive misses (~10s wall-clock)
+- On threshold breach: DPU marked `DEGRADED` in PostgreSQL placement table
+- Effect: scheduler excludes that DPU from new VM placement decisions
+- On heartbeat recovery: DPU transitions to `RECOVERING`, then `READY` after full state reconciliation
+
+### Sub-Agent Lifecycle State Machine
+
+```
+     start
+       │
+       ▼
+  ┌──────────┐   IPC connected   ┌────────────┐  all checks pass  ┌───────┐
+  │  INIT    ├───────────────────►│ REGISTERING├───────────────────►│ READY │
+  └──────────┘                   └─────┬──────┘                   └───┬───┘
+                                       │                               │
+                                       │ register failed               │ heartbeat
+                                       ▼                               │ lost
+                                  ┌──────────┐                         │
+                                  │  FATAL   │                         ▼
+                                  └──────────┘                  ┌──────────┐
+                                                                │ DEGRADED │
+                                       ┌────────────────────────┴────┬─────┘
+                                       │                             │
+                                       │ reconnect +                 │ watchdog
+                                       │ FullActualStateReport       │ expires
+                                       ▼                             ▼
+                                  ┌──────────┐                  ┌──────────┐
+                                  │RECOVERING│                  │  FATAL   │
+                                  └────┬─────┘                  └──────────┘
+                                       │ reconciliation complete
+                                       ▼
+                                  ┌───────┐
+                                  │ READY │
+                                  └───────┘
+```
+
+### IPC Watchdog Configuration
+
+```toml
+[ipc.watchdog]
+heartbeat_interval = "5s"
+degraded_threshold = "30s"
+fatal_threshold = "5m"
+preserve_datapath = true  # fail-safe: existing flows continue forwarding
+
+[ipc.reconnect]
+initial_backoff = "100ms"
+max_backoff = "5s"
+multiplier = 2.0
+reconciliation_timeout = "30s"
+```
+
+---
+
 ## IPAM Strategy (external, stub for Phase 1)
 
 IPAM lives in the external Inventory/Capacity service. trail-boss is a **lease consumer only** — it never mints IPs or VNIs directly.
@@ -423,12 +622,31 @@ type IPAMClient interface {
 }
 ```
 
-**Phase 1**: `StubIPAMClient` — in-memory bump allocator with pre-seeded pools.
+**Phase 1**: `ChaosIPAMStub` — in-memory bump allocator with pre-seeded pools and built-in fault injection that exercises error paths from day one.
+
+The chaos stub ensures that code consuming IPAM never silently depends on happy-path assumptions that collapse under real allocator behavior. On every `Allocate` call the stub:
+
+1. Injects random latency (10-100ms, uniform) on 20% of calls, forcing all callers through async-safe code paths.
+2. Returns `POOL_EXHAUSTED` on 5% of allocations, exercising partial-allocation rollback.
+3. Expires leases after a configurable interval (default 1h), triggering lease-renewal logic.
+4. On process restart, loads persisted allocation state from a local JSON file rather than re-seeding — simulates existing-allocation reconciliation.
+
+```toml
+[ipam_stub]
+chaos_mode = true          # default true in dev/test, false for demos
+latency_pct = 20
+latency_min_ms = 10
+latency_max_ms = 100
+exhaustion_pct = 5
+lease_ttl = "1h"
+state_file = "/var/lib/trail-boss/ipam-stub-state.json"
+```
+
 **Phase 2**: `GRPCIPAMClient` — talks to the real Inventory service.
 
 **Inventory stock updates**: when trail-corral creates/destroys interfaces, trail-boss reports capacity changes back to Inventory. For Phase 1 this is a no-op stub; the interface is ready for when Inventory API is available.
 
-**Error handling**:
+**Error handling** — Because the chaos stub injects `POOL_EXHAUSTED`, timeout, and stale-lease errors from day one, all error paths are continuously validated in every CI run:
 - IPAM down + new allocation → **fail-closed** (no double-allocation risk)
 - IPAM down + read existing → **serve from local cache** (existing leases are stable)
 - IPAM down + release → **queue locally, retry with backoff** (idempotent)
@@ -487,6 +705,78 @@ NATS replaces Valkey entirely. Each trail-boss instance embeds a NATS server; th
 
 **Epoch-based fencing**: session registration bumps per-DPU epoch in the `sessions` KV bucket (CAS); stale commands from old owners are rejected by comparing epochs.
 
+### Epoch Fencing Protocol (trail-hand validation)
+
+Every command from trail-boss to trail-hand carries the session epoch in a `CommandEnvelope` protobuf wrapper. trail-hand enforces monotonic epoch ordering and rejects stale commands.
+
+**Rules:**
+
+1. trail-hand stores `registered_epoch` — set when a boss successfully calls `RegisterOwnership(epoch)`
+2. Any `CommandEnvelope` with `epoch < registered_epoch` is rejected immediately with `EPOCH_STALE`
+3. trail-hand does NOT execute partial commands from a stale epoch; the entire envelope is discarded
+4. Boss must send a `LeaseRenew` heartbeat every 10s. If trail-hand misses 3 consecutive heartbeats (30s timeout), it transitions to `UNOWNED` state and refuses all commands until a new boss registers
+
+**Proto definition:**
+
+```protobuf
+message CommandEnvelope {
+  uint64 epoch = 1;
+  google.protobuf.Timestamp issued_at = 2;
+  oneof payload {
+    ApplyFlowRules apply_flow_rules = 10;
+    RevokeFlowRules revoke_flow_rules = 11;
+    ConfigUpdate config_update = 12;
+    LeaseRenew lease_renew = 13;
+  }
+}
+
+message LeaseRenew {
+  uint64 epoch = 1;
+  google.protobuf.Duration interval = 2;
+}
+
+message CommandResponse {
+  uint64 accepted_epoch = 1;
+  enum Status {
+    OK = 0;
+    EPOCH_STALE = 1;
+    UNOWNED = 2;
+    INTERNAL_ERROR = 3;
+  }
+  Status status = 2;
+  string detail = 3;
+}
+```
+
+**GC-pause fencing scenario:**
+
+```
+Boss-A          trail-hand           Boss-B (new leader)
+  │                 │                      │
+  │── LeaseRenew(epoch=7) ──►│             │
+  │                 │ registered_epoch=7   │
+  │                 │                      │
+  │  [Boss-A GC pause / network partition] │
+  │                 │                      │
+  │                 │◄── 30s no heartbeat ─┤
+  │                 │ → state = UNOWNED    │
+  │                 │                      │
+  │                 │◄── RegisterOwnership(epoch=8)
+  │                 │ registered_epoch=8   │
+  │                 │ → state = OWNED      │
+  │                 │──── OK ─────────────►│
+  │                 │                      │
+  │                 │◄── ApplyFlowRules(epoch=8)
+  │                 │──── OK ─────────────►│
+  │                 │                      │
+  │── ApplyFlowRules(epoch=7) ──►│         │
+  │                 │ epoch 7 < 8 → REJECT │
+  │◄── EPOCH_STALE ─┤                      │
+  │                 │                      │
+```
+
+Boss-A's GC pause causes it to miss the heartbeat window. trail-hand revokes ownership after 30s, Boss-B wins leader election and registers epoch=8. When Boss-A recovers and sends stale epoch=7 command, trail-hand rejects it deterministically.
+
 **Config**:
 ```toml
 # /etc/trail-boss/config.toml
@@ -500,6 +790,133 @@ store_dir = "/var/lib/trail-boss/nats"  # JetStream data (memory-backed, this is
 
 [ha]
 instance_id = "boss-a"  # unique per instance, auto-generated if empty
+```
+
+---
+
+## DPU Memory Budget
+
+The BlueField-3 DPU provides 16GB of RAM shared between the embedded ARM OS, DOCA
+framework services, crypto offload buffers, and all Trail agent processes. The total
+memory allocation for all 8 Trail agent binaries under peak load must not exceed
+**1GB**, leaving at minimum 20% headroom (approximately 3GB on a 16GB SoC) for the
+Linux kernel, DOCA runtime, OpenSSL/libcrypto page cache, OVS-related kernel
+structures, and tc-flower netlink buffers.
+
+### Per-Binary Memory Targets
+
+| Binary | Role | GOMEMLIMIT | MemoryHigh (80%) | MemoryMax | Measured Idle RSS |
+|--------|------|-----------|------------------|-----------|-------------------|
+| trail-hand | Coordinator, session state for all sub-agents | 64MiB | 51MiB | 64MiB | ~28MiB |
+| trail-corral | VF/SF lifecycle management | 48MiB | 38MiB | 48MiB | ~18MiB |
+| trail-gate | Firewall rule compilation, tc-flower batch ops | 128MiB | 102MiB | 128MiB | ~42MiB |
+| trail-pen | Security group evaluation and flow caching | 96MiB | 76MiB | 96MiB | ~34MiB |
+| trail-path | Overlay routing, VNI lookup table | 64MiB | 51MiB | 64MiB | ~24MiB |
+| trail-brand | DHCP lease state, minimal footprint | 32MiB | 25MiB | 32MiB | ~14MiB |
+| trail-trough | Load-balancer rule sets and health state | 48MiB | 38MiB | 48MiB | ~20MiB |
+| trail-latch | WireGuard tunnel state and key material | 48MiB | 38MiB | 48MiB | ~18MiB |
+| **Total** | | **528MiB** | | **528MiB** | **~198MiB** |
+
+The 528MiB total leaves 472MiB of the 1GB envelope unallocated, providing burst
+capacity during rule-set compilation spikes and protecting against GC pressure
+cascades across binaries.
+
+### Cgroup Slice Architecture
+
+All Trail agents run under a shared `trail.slice` with a combined hard ceiling:
+
+```ini
+# /etc/systemd/system/trail.slice
+[Slice]
+Description=Trail DPU Agent Slice
+MemoryMax=1200M
+MemoryHigh=960M
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=80%
+```
+
+The slice-level `MemoryMax=1200M` (rather than exactly 1024M) accounts for transient
+kernel-side allocations (netlink socket buffers, cgroup metadata) attributed to the
+slice but outside Go heap.
+
+### Systemd Unit Example: trail-gate
+
+```ini
+[Unit]
+Description=Trail Gate — DPU Firewall Rule Agent
+After=trail-hand.service
+BindsTo=trail-hand.service
+PartOf=trail.slice
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/trail-gate --config /etc/trail-gate/config.toml
+Slice=trail.slice
+
+# Memory enforcement
+MemoryMax=128M
+MemoryHigh=102M
+
+# Go runtime tuning
+Environment=GOMEMLIMIT=128MiB
+Environment=GOGC=50
+Environment=GOMAXPROCS=4
+
+# Security hardening
+User=trail
+Group=trail
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/trail-gate
+StateDirectory=trail-gate
+ConfigurationDirectory=trail-gate
+
+# Restart policy
+Restart=on-failure
+RestartSec=2s
+WatchdogSec=30s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Key settings:
+
+- **`MemoryMax=128M`** — hard cgroup limit; OOM killer terminates if exceeded. Matches GOMEMLIMIT so the Go GC aggressively reclaims before the kernel intervenes.
+- **`MemoryHigh=102M`** (80%) — kernel throttles allocations and emits `memory.high` event, giving time to shed load before hitting the hard wall.
+- **`GOMEMLIMIT=128MiB`** — Go 1.19+ runtime targets this as heap ceiling. GC runs more frequently as RSS approaches.
+- **`GOGC=50`** — reduces GC target growth ratio from 100% to 50%, producing more frequent but smaller GC pauses.
+- **`GOMAXPROCS=4`** — limits Go scheduler threads to 4 of 16 available A78 cores.
+
+### IPC Back-Pressure Strategy
+
+When a sub-agent's RSS crosses the `MemoryHigh` threshold (80% of budget):
+
+1. **Cgroup notification** — systemd detects `memory.high` breach. trail-hand monitors via `sd_bus`.
+2. **Flow control** — trail-hand stops dispatching new work to the pressured sub-agent.
+3. **Shed ephemeral state** — agent evicts LRU-cached flow entries and compiled rule fragments.
+4. **Propagate upstream** — if pressure persists >5s, trail-hand reports `RESOURCE_EXHAUSTED` to trail-boss. Control plane can rebalance tenant assignments.
+5. **Recovery** — once RSS drops below 70% (sustained 3s), trail-hand resumes dispatching.
+
+### Validation
+
+Memory budgets are validated in CI via integration tests that run all 8 binaries
+simultaneously under simulated load (500 tenants, 2000 firewall rules per tenant for
+trail-gate) on an ARM64 runner. Assertions:
+
+- No individual binary exceeds its `MemoryMax` within 60 seconds of sustained load
+- Combined RSS of all 8 binaries remains below 1000MiB at p99
+- Back-pressure activates correctly when synthetic memory pressure is injected
+
+Production metrics exported by trail-hand:
+
+```
+trail_agent_rss_bytes{agent="trail-gate"}
+trail_agent_gomemlimit_bytes{agent="trail-gate"}
+trail_agent_memory_pressure_events_total{agent="trail-gate"}
+trail_agent_shed_operations_total{agent="trail-gate"}
 ```
 
 ---
@@ -684,13 +1101,232 @@ In monorepo: one `go.mod`, one version, one PR to change shared code.
 
 ## Release Strategy
 
-- No goreleaser or semantic-release — manual `make package` for now
-- One version number for ALL binaries (they deploy together)
-- `VERSION ?= 0.1.0` in Makefile, injected via ldflags
-- Tag: `v1.2.3` → all binaries are v1.2.3
-- Packages: `trail-boss-0.1.0.amd64.deb` + `trail-dpu-0.1.0.arm64.deb`
-- Published to internal package registry
-- Deploy: `deploy/deploy-to-lab.sh` (rsync + SSH + systemd restart)
+Semantic-release with Conventional Commits from day one. No manual version bumps, no goreleaser — version numbers are derived from commit history automatically.
+
+### Two Release Trains
+
+The monorepo produces two independently-versioned package groups:
+
+| Train | Contents | Versioning | Rationale |
+|-------|----------|------------|-----------|
+| `trail-boss` | trail-boss binary, migrations, systemd unit | Independent semver | Control plane ships on its own cadence; unblocked by DPU work |
+| `trail-dpu` | All 8 DPU binaries (trail-hand + sub-agents), systemd units, TOML configs | Single package semver | DPU agents deploy together on the same BlueField-3; mixed versions on one DPU are not supported |
+
+This avoids the single-version-blocks-everything problem: a control-plane bugfix ships without waiting for DPU agent stabilization, and vice versa.
+
+### Protocol Version Compatibility
+
+The `agent.proto` AgentHello message carries a `protocol_version` field:
+
+```protobuf
+message AgentHello {
+  string agent_id = 1;
+  string hostname = 2;
+  uint32 protocol_version = 3;  // Incremented on breaking wire changes
+  string package_version = 4;   // e.g. "1.4.2"
+}
+```
+
+**Compatibility guarantee:** trail-boss at version N supports trail-dpu at versions N-1 through N+1. This gives a one-version skew window for rolling upgrades.
+
+trail-hand validates on connect:
+
+```go
+func (h *HandServer) validateHello(hello *pb.AgentHello) error {
+    if hello.ProtocolVersion < minSupportedProtocol ||
+       hello.ProtocolVersion > maxSupportedProtocol {
+        return connect.NewError(connect.CodeFailedPrecondition,
+            fmt.Errorf("protocol_version %d not in supported range [%d, %d]",
+                hello.ProtocolVersion, minSupportedProtocol, maxSupportedProtocol))
+    }
+    return nil
+}
+```
+
+### CI Pipeline
+
+```
+main merge → semantic-release → tag → build + package → publish
+```
+
+1. **On main merge:** semantic-release analyzes commits scoped to each package, bumps the appropriate version, creates a Git tag (`trail-boss/v1.2.3` or `trail-dpu/v0.8.1`).
+2. **On tag:** CI builds cross-compiled binaries, runs nfpm, publishes to internal package registry.
+3. **Separate release configs** ensure boss and dpu packages release independently based on commit scopes.
+
+Conventional Commits enforced via commitlint in CI — PRs with malformed commit messages fail before merge:
+
+```yaml
+# .commitlintrc.yaml
+extends:
+  - "@commitlint/config-conventional"
+rules:
+  scope-enum:
+    - 2
+    - always
+    - [boss, dpu, hand, corral, gate, pen, path, brand, trough, latch, proto, ci, docs]
+  scope-empty:
+    - 2
+    - never
+```
+
+### semantic-release Configuration
+
+```yaml
+# release/trail-boss.releaserc.yaml
+tagFormat: "trail-boss/v${version}"
+plugins:
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+      releaseRules:
+        - { scope: "boss", release: "patch" }
+        - { scope: "boss", type: "feat", release: "minor" }
+        - { scope: "boss", type: "fix", release: "patch" }
+        - { scope: "proto", release: "minor" }
+      parserOpts:
+        noteKeywords: ["BREAKING CHANGE", "BREAKING-CHANGE"]
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+  - - "@semantic-release/exec"
+    - prepareCmd: |
+        make package-boss VERSION=${nextRelease.version}
+      publishCmd: |
+        deploy/publish-package.sh trail-boss ${nextRelease.version} amd64
+  - - "@semantic-release/git"
+    - assets: ["CHANGELOG-boss.md"]
+      message: "chore(boss): release ${nextRelease.version} [skip ci]"
+  - - "@semantic-release/github"
+    - assets:
+        - path: dist/trail-boss-${nextRelease.version}.amd64.deb
+        - path: dist/trail-boss-${nextRelease.version}.amd64.rpm
+---
+# release/trail-dpu.releaserc.yaml
+tagFormat: "trail-dpu/v${version}"
+plugins:
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+      releaseRules:
+        - { scope: "dpu", release: "patch" }
+        - { scope: "hand", release: "patch" }
+        - { scope: "corral", release: "patch" }
+        - { scope: "gate", release: "patch" }
+        - { scope: "pen", release: "patch" }
+        - { scope: "path", release: "patch" }
+        - { scope: "brand", release: "patch" }
+        - { scope: "trough", release: "patch" }
+        - { scope: "latch", release: "patch" }
+        - { type: "feat", release: "minor" }
+        - { scope: "proto", release: "minor" }
+      parserOpts:
+        noteKeywords: ["BREAKING CHANGE", "BREAKING-CHANGE"]
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+  - - "@semantic-release/exec"
+    - prepareCmd: |
+        make package-dpu VERSION=${nextRelease.version}
+      publishCmd: |
+        deploy/publish-package.sh trail-dpu ${nextRelease.version} arm64
+  - - "@semantic-release/git"
+    - assets: ["CHANGELOG-dpu.md"]
+      message: "chore(dpu): release ${nextRelease.version} [skip ci]"
+  - - "@semantic-release/github"
+    - assets:
+        - path: dist/trail-dpu-${nextRelease.version}.arm64.deb
+        - path: dist/trail-dpu-${nextRelease.version}.arm64.rpm
+```
+
+### Package Artifacts
+
+| Artifact | Arch | Repository |
+|----------|------|------------|
+| `trail-boss-{version}.amd64.deb` | amd64 | Internal apt repo |
+| `trail-boss-{version}.amd64.rpm` | amd64 | Internal yum repo |
+| `trail-dpu-{version}.arm64.deb` | arm64 | Internal apt repo |
+| `trail-dpu-{version}.arm64.rpm` | arm64 | Internal yum repo |
+
+The `trail-dpu` package contains all 8 binaries, their systemd units, default TOML configs under `/etc/trail/`, and a shared `trail-dpu.conf` tmpfiles.d entry.
+
+### Deployment Tiers
+
+| Criterion | Lab | Staging | Production |
+|-----------|-----|---------|------------|
+| DPU count | < 10 | 10 - 50 | 50+ |
+| Tooling | `deploy/deploy-to-lab.sh` | Ansible | NICo lifecycle integration |
+| Parallelism | All at once | Batches of 5 | Canary 1% → 5% → 25% → 100% |
+| Health gates | None (manual verification) | Ansible health-check task between batches | Automated: metrics + error-rate threshold |
+| Rollback trigger | Manual | Ansible `--limit failed` | Automatic on SLO breach |
+| Time to full rollout | ~30 seconds | ~10 minutes | ~2 hours |
+
+**Lab (<10 DPUs):** `deploy/deploy-to-lab.sh` — rsync binaries, SSH to restart systemd units:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+HOSTS="${1:-lab-dpu-01 lab-dpu-02 lab-dpu-03}"
+VERSION="${2:-$(git describe --tags --match 'trail-dpu/*' --abbrev=0 | sed 's|trail-dpu/v||')}"
+
+for host in $HOSTS; do
+  echo ">>> Deploying trail-dpu ${VERSION} to ${host}"
+  rsync -az dist/trail-dpu-${VERSION}.arm64.deb "${host}:/tmp/"
+  ssh "$host" "sudo dpkg -i /tmp/trail-dpu-${VERSION}.arm64.deb && sudo systemctl restart trail-hand"
+done
+```
+
+**Staging (10-50 DPUs):** Ansible playbook with rolling updates and health verification:
+
+```yaml
+# deploy/ansible/deploy-dpu.yml
+- hosts: staging_dpus
+  serial: 5
+  tasks:
+    - name: Install trail-dpu package
+      apt:
+        name: "trail-dpu={{ trail_dpu_version }}"
+        state: present
+        force: yes
+
+    - name: Restart trail-hand (cascades to sub-agents)
+      systemd:
+        name: trail-hand
+        state: restarted
+
+    - name: Wait for health endpoint
+      uri:
+        url: "http://{{ inventory_hostname }}:9100/healthz"
+        status_code: 200
+      retries: 10
+      delay: 3
+
+    - name: Verify sub-agent registration
+      command: trail-hand status --format=json
+      register: agent_status
+      failed_when: (agent_status.stdout | from_json).registered_agents < expected_agents
+```
+
+**Production (50+ DPUs):** NICo lifecycle integration with canary progression:
+
+```
+Canary stages: 1% (15 min observe) → 5% (15 min) → 25% (30 min) → 100%
+Abort criteria: error_rate > 0.1% OR p99_latency > 50ms OR agent_reconnect_rate > 5/min
+```
+
+### Rollback
+
+Rollback at all tiers uses package manager downgrade:
+
+```bash
+# Downgrade to previous version
+sudo apt install trail-dpu=1.3.7
+
+# trail-hand performs graceful handoff:
+# 1. Receives SIGTERM from systemd
+# 2. Sends Draining message to sub-agents via Unix socket
+# 3. Sub-agents complete in-flight tc-flower operations (max 5s)
+# 4. Sub-agents close Unix socket connections
+# 5. trail-hand exits; systemd restarts with new (old) binary
+# 6. Sub-agents reconnect and re-register via AgentHello
+```
+
+The protocol_version compatibility window (N-1 through N+1) ensures that during a rollback, trail-boss still accepts connections from trail-dpu at the previous version.
 
 ---
 
@@ -725,45 +1361,324 @@ require (
 
 ## Migration Steps
 
-1. Create new repo: `technicolor-haze-trail`
-2. Initialize go.mod, Makefile, buf.yaml, buf.gen.yaml, tools.go
-3. Add `third_party/technicolor-haze-proto` as git submodule
-4. Create `internal/domain/` with pure types
-5. Create `internal/obs/` (logger, metrics push+pull, health)
-6. Create `internal/config/` (TOML + env)
-7. Move NM code → `internal/boss/` + `cmd/trail-boss/`
-8. Implement `internal/boss/bus/` (NATS embedded)
-9. Create `internal/ipamclient/` (interface + stub)
-10. Move firewall agent → `cmd/trail-gate/` + `internal/netlink/`
-11. Create `cmd/trail-corral/` (interface lifecycle)
-12. Create `internal/subagent/` framework (IPC, reconciler)
-13. Create `internal/hand/` (trail-hand agent logic)
-14. Create stub `cmd/` entries for other sub-agents
-15. Create `packaging/` (nfpm, systemd, scripts)
-16. Create `test/e2e/` (full lifecycle with mock netlink)
-17. Create CI workflow
-18. Create `deploy/deploy-to-lab.sh`
-19. Update `technicolor-haze-firewall` README: "DEPRECATED — moved to technicolor-haze-trail"
-20. Archive `technicolor-haze-firewall` repo
+Four phases, each time-boxed to 2-3 weeks. Checkpoints at step 5, 10, 15, and 20 gate forward progress: CI must be green, the monorepo must produce deployable artifacts, and remaining steps are re-baselined against actuals.
+
+---
+
+### Phase 1 — Repository Bootstrap and History Import (weeks 1-3)
+
+**Goal:** New monorepo with full git history from both source repos, CI skeleton, and Go workspace compiling.
+
+**Step 1. Create the monorepo and import trail-boss (network-manager) history.**
+
+```bash
+git clone git@github.com:mara-baysn/technicolor-haze-network-manager.git /tmp/nm-export
+cd /tmp/nm-export
+
+git filter-repo \
+  --path-rename 'cmd/network-manager/:cmd/trail-boss/' \
+  --path-rename 'internal/:internal/boss/' \
+  --tag-rename '':'boss-'
+
+cd /path/to/technicolor-haze-trail
+git remote add nm-import /tmp/nm-export
+git fetch nm-import --tags
+git merge nm-import/main --allow-unrelated-histories \
+  -m "import: trail-boss history via git-filter-repo"
+git remote remove nm-import
+```
+
+**Step 2. Import trail-gate (firewall) history into the monorepo.**
+
+```bash
+git clone git@github.com:mara-baysn/technicolor-haze-firewall.git /tmp/fw-export
+cd /tmp/fw-export
+
+git filter-repo \
+  --path-rename 'cmd/firewall/:cmd/trail-gate/' \
+  --path-rename 'internal/tcflower/:internal/netlink/' \
+  --path-rename 'internal/reconciler/:internal/subagent/reconciler/' \
+  --path-rename 'internal/':internal/ \
+  --tag-rename '':'gate-'
+
+cd /path/to/technicolor-haze-trail
+git remote add fw-import /tmp/fw-export
+git fetch fw-import --tags
+git merge fw-import/main --allow-unrelated-histories \
+  -m "import: trail-gate history via git-filter-repo"
+git remote remove fw-import
+```
+
+**Step 3. Establish unified go.mod and resolve dependency conflicts.**
+
+Create single `go.mod` at repo root. Pin to Go 1.25. Resolve version conflicts between the two imports (keep higher semver). Add `third_party/technicolor-haze-proto` as git submodule.
+
+**Step 4. Scaffold canonical directory layout.**
+
+Create the target directory structure (see Target Structure section). Move imported code into canonical locations. Update all import paths.
+
+**Step 5. CI skeleton: cross-compile check for both architectures.**
+
+Configure CI to: `go build ./...` for both amd64 and arm64, `go vet ./...`, `go test ./...` (unit tests only).
+
+---
+
+> **CHECKPOINT 1 (end of step 5):** CI is green. Both architectures cross-compile. `git log --follow` traces files back to original repos. No functional changes yet. Re-estimate remaining phases.
+
+---
+
+### Phase 2 — Shared Infrastructure and Internal Restructuring (weeks 4-6)
+
+**Goal:** All shared packages extracted, sub-agent framework created, all binaries compile.
+
+**Step 6. Extract shared packages into canonical locations.**
+
+Deduplicate: `internal/domain/`, `internal/obs/`, `internal/config/`, `internal/netlink/`, `internal/transport/`. Update import paths across all cmd/ binaries.
+
+**Step 7a. Move network-manager server code (mechanical file move only).**
+
+Pure file move from `internal/boss/server/` to final location. No API changes. All existing tests must pass.
+
+**Step 7b. Refactor server to ConnectRPC service interface.**
+
+Define ConnectRPC service in proto. Generate stubs. Implement service. Keep old API as thin wrapper — no callers break yet.
+
+**Step 7c. Migrate upstream callers to ConnectRPC client.**
+
+Replace direct function calls with ConnectRPC client calls. Remove compatibility wrapper. All interactions go through protobuf contract.
+
+**Step 8. Implement `internal/boss/bus/` (NATS embedded).**
+
+Wire embedded NATS, JetStream KV buckets, subject routing. Integration test: 3-boss cluster forms, session CAS works.
+
+**Step 9. Create `internal/ipamclient/` (interface + chaos stub).**
+
+**Step 10. Create `internal/subagent/` framework (IPC, reconciler) + `internal/hand/`.**
+
+---
+
+> **CHECKPOINT 2 (end of step 10):** All 4 Phase 1 binaries compile and pass unit tests. Sub-agent IPC framework works in integration test. nfpm packages produced for both architectures. Re-baseline phase 3 estimates.
+
+---
+
+### Phase 3 — Integration, Testing, and Hardware Validation (weeks 7-9)
+
+**Goal:** End-to-end flow working on real BF3 hardware. Integration and E2E tests passing.
+
+**Step 11. Wire trail-hand ↔ trail-boss bidi session end-to-end.**
+
+**Step 12. Wire trail-hand ↔ trail-gate sub-agent IPC end-to-end.**
+
+**Step 13. Wire trail-hand ↔ trail-corral interface lifecycle.**
+
+**Step 14. Create `test/e2e/` (full lifecycle with mock netlink + multi-process E2E).**
+
+**Step 15. Hardware smoke test on lab BF3 DPU.**
+
+Deploy arm64 package to lab DPU. Verify: trail-hand starts, registers with trail-boss, trail-gate programs a tc-flower rule, trail-corral creates a VF.
+
+---
+
+> **CHECKPOINT 3 (end of step 15):** Integration tests pass. Lab DPU runs monorepo-built agents. System is ready for shadow deployment. Re-baseline phase 4.
+
+---
+
+### Phase 4 — Canary Cutover and Decommission (weeks 10-12)
+
+**Goal:** Production traffic validated on monorepo builds. Old repos go read-only.
+
+**Step 16. Shadow mode deployment (1+ week minimum).**
+
+Deploy trail-boss alongside existing control plane in shadow mode. Compare decisions without programming DPUs. Alert on divergence; run until zero divergence for 72+ hours.
+
+**Step 17. Canary rack: 5-10 DPUs on trail (1 week minimum).**
+
+Cut canary DPUs over to monorepo-built agents. Monitor convergence time, packet drops, tc-flower errors. Rollback criteria: any p99 regression >10% or data-plane packet loss.
+
+**Step 18. Expand canary to 25% of fleet (3-5 days).**
+
+**Step 19. Full fleet cutover (rolling, one rack at a time).**
+
+**Step 20. Set old repos to read-only (NOT archived).**
+
+Update README in old repos. Keep CI running so existing tags remain reproducible.
+
+---
+
+> **CHECKPOINT 4 (end of step 20):** Production fleet runs on monorepo-built binaries. Old repos are read-only.
+
+---
+
+### Post-Cutover Retention (steps 21-25)
+
+**Step 21.** Dual-build verification (nightly CI in old repos, first 2 weeks).
+**Step 22.** Freeze old-repo dependency updates.
+**Step 23.** Backport window closes (day 30).
+**Step 24.** Remove old-repo CI runners (day 45).
+**Step 25.** Final retention review (day 60). Confirm zero rollback events. Old repos remain read-only. Document migration complete.
+
+### Summary Timeline
+
+| Phase | Steps | Duration | Key Gate |
+|-------|-------|----------|----------|
+| 1 — Bootstrap + History Import | 1-5 | 2-3 weeks | CI green, both arches compile, history preserved |
+| 2 — Shared Infrastructure | 6-10 | 2-3 weeks | All binaries build, packages produced |
+| 3 — Integration + Hardware | 11-15 | 2-3 weeks | Integration tests pass, lab DPU validated |
+| 4 — Canary Cutover | 16-25 | 2-3 weeks active + 60-day retention tail | Fleet migrated, old repos read-only |
+
+**Total active migration work: 8-12 weeks.** The 60-day retention tail runs passively.
 
 ---
 
 ## What to Implement in Phase 1
 
-| Binary | Status | Phase 1 |
-|--------|--------|---------|
-| trail-boss | Exists (v1) | Refactor: ConnectRPC, TOML config, NATS HA, IPAM stub |
-| trail-hand | New | Implement: capability discovery, sub-agent lifecycle, bidi session |
-| trail-corral | New | Implement: VF create/destroy, link up/down (required by all others) |
-| trail-gate | Exists | Move from technicolor-haze-firewall, wire to sub-agent framework |
-| trail-pen | New | Stub (reconciler loop + placeholder) |
-| trail-path | New | Stub |
-| trail-brand | New | Stub |
-| trail-trough | New | Stub |
-| trail-latch | New | Stub |
+Phase 1 delivers a working end-to-end slice: control plane to DPU, with one fully functional sub-agent proving the architecture. No stubs, no placeholders that rot.
 
-Phase 1 delivers: trail-boss + trail-hand + trail-corral + trail-gate working end-to-end.
-Other sub-agents are stubs that can be implemented incrementally.
+| Binary | Phase 1 Scope | Notes |
+|--------|--------------|-------|
+| `trail-boss` | Full control plane: ConnectRPC API, PostgreSQL state, embedded NATS pub/sub to DPU fleet, desired-state compilation, convergence tracking | amd64, Tier 2 |
+| `trail-hand` | Master agent on DPU: manages sub-agent lifecycle, Unix socket IPC multiplexer, health aggregation, NATS uplink to trail-boss, config distribution | arm64, BF3 |
+| `trail-corral` | VF/SF pool manager: allocates PCIe VFs, tracks NUMA affinity, binds VFs to tenants, reports capacity to trail-boss | arm64, sub-agent of trail-hand |
+| `trail-gate` | **Reference implementation sub-agent.** Firewall: programs per-VF L3/L4 ACL + connection tracking rules into eSwitch via tc-flower/netlink. Implements the full sub-agent contract. | arm64, sub-agent of trail-hand |
+| `trail-pen` | Not implemented. Future: per-VM stateful ACLs (security group rules) | Create from trail-gate template when staffed |
+| `trail-path` | Not implemented. Future: VPC overlay (VXLAN/Geneve), route programming, VNI management | Create from trail-gate template when staffed |
+| `trail-brand` | Not implemented. Future: DHCP server responses on VF representors | Create from trail-gate template when staffed |
+| `trail-trough` | Not implemented. Future: L4 DNAT/ECMP rule programming on eSwitch | Create from trail-gate template when staffed |
+| `trail-latch` | Not implemented. Future: WireGuard tunnel data-plane, ZTNA auth | Create from trail-gate template when staffed |
+
+**Phase 1 exit criteria:** trail-boss pushes a firewall policy change over NATS, trail-hand receives it, dispatches to trail-gate over Unix socket IPC, trail-gate programs the eSwitch via tc-flower, reports actual state back up the chain, trail-boss confirms convergence. Tested on real BF3 hardware with a VF carrying tenant traffic.
+
+**What we deliberately do NOT ship:** stub `cmd/` entries for unimplemented sub-agents. Stubs rot, give false confidence in CI ("all binaries build!"), and accumulate drift from the real contract. Instead, new sub-agents are created from scratch using trail-gate as the living template when an engineer is staffed to implement them.
+
+---
+
+### Sub-Agent Contract
+
+Every sub-agent that registers with trail-hand must implement two interfaces: the IPC transport interface (how trail-hand communicates with it) and the reconciler interface (how it converges actual state toward desired state). trail-gate is the reference implementation of both.
+
+#### IPC Interface (ConnectRPC over Unix Socket)
+
+Each sub-agent exposes a ConnectRPC service on a Unix domain socket at a well-known path (`/run/trail/{agent-name}.sock`). trail-hand connects as a client.
+
+```protobuf
+// trail/agent/v1/subagent.proto
+
+service SubAgent {
+  // Called once after socket connection. Sub-agent declares its identity,
+  // capabilities, and which pipeline stages it owns.
+  rpc Connect(ConnectRequest) returns (ConnectResponse);
+
+  // trail-hand pushes desired state for the pipeline stages this sub-agent owns.
+  rpc HandleDesiredState(DesiredStateRequest) returns (DesiredStateResponse);
+
+  // trail-hand polls or sub-agent streams actual state back.
+  rpc ReportActualState(ActualStateRequest) returns (ActualStateResponse);
+
+  // Liveness + readiness. trail-hand calls on interval; failure triggers restart.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message ConnectRequest {
+  string hand_version = 1;
+  uint64 boot_epoch = 2;
+}
+
+message ConnectResponse {
+  string agent_name = 1;           // e.g. "trail-gate"
+  string agent_version = 2;
+  repeated string capabilities = 3; // e.g. ["acl", "conntrack", "stateful-sg"]
+  repeated PipelineStage stages = 4; // stages this agent owns
+}
+
+message PipelineStage {
+  uint32 stage_number = 1;         // matches DPU Orchestrator stage model
+  string stage_name = 2;           // e.g. "nacl"
+}
+
+message DesiredStateRequest {
+  uint64 generation = 1;
+  uint32 stage_number = 2;
+  bytes config_payload = 3;        // stage-specific protobuf, opaque to trail-hand
+  string vni = 4;                  // scope: which tenant/VNI this applies to
+}
+
+message DesiredStateResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+message ActualStateRequest {
+  uint32 stage_number = 1;
+  string vni = 2;                  // empty = all VNIs for this stage
+}
+
+message ActualStateResponse {
+  uint64 generation = 1;           // last successfully applied generation
+  ConvergenceState state = 2;
+  bytes actual_payload = 3;
+  repeated string divergence_reasons = 4;
+}
+
+enum ConvergenceState {
+  CONVERGENCE_STATE_UNSPECIFIED = 0;
+  CONVERGED = 1;
+  PROGRAMMING = 2;
+  DIVERGED = 3;
+  ERROR = 4;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  bool ready = 2;
+  string status_message = 3;
+  map<string, string> diagnostics = 4;
+}
+```
+
+#### Reconciler Interface (Go, internal to each sub-agent)
+
+Each sub-agent implements this Go interface internally — the core loop that converges hardware state toward desired configuration.
+
+```go
+// internal/subagent/reconciler/reconciler.go
+
+type Rule interface {
+    Key() string
+    Equal(other Rule) bool
+}
+
+type Reconciler interface {
+    Desired() []Rule
+    Actual() ([]Rule, error)
+    Apply(delta Delta) error
+    Rollback() error
+}
+
+type Delta struct {
+    Add    []Rule
+    Remove []Rule
+    Modify []RuleChange
+}
+
+type RuleChange struct {
+    Old Rule
+    New Rule
+}
+```
+
+#### Registration Protocol
+
+When trail-hand starts (or restarts), it discovers sub-agents by scanning `/run/trail/*.sock`. For each socket found:
+
+1. **Connect** — trail-hand calls `SubAgent.Connect()`. The sub-agent responds with its name, version, capabilities, and owned pipeline stages.
+2. **Validate** — trail-hand checks that no two sub-agents claim the same pipeline stage. Conflicts are fatal.
+3. **Hydrate** — trail-hand immediately calls `HandleDesiredState` with the last-known desired state for each stage the sub-agent owns.
+4. **Health loop** — trail-hand calls `HealthCheck` every 5s. Three consecutive failures trigger sub-agent restart via systemd.
+5. **Steady state** — On each desired-state update from trail-boss (NATS), trail-hand routes it to the owning sub-agent via `HandleDesiredState`.
+
+**Startup ordering:** trail-hand starts first (systemd `Before=` dependency). Sub-agents start after and create their socket. trail-hand uses inotify on `/run/trail/` to detect new sockets without polling.
 
 ---
 
