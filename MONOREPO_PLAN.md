@@ -236,6 +236,7 @@ technicolor-haze-trail/
 │   │   ├── trail-pen.service
 │   │   ├── trail-path.service
 │   │   ├── trail-brand.service
+│   │   ├── trail-horn.service
 │   │   ├── trail-trough.service
 │   │   └── trail-latch.service
 │   ├── scripts/
@@ -356,7 +357,7 @@ All DPU agents run under `trail.slice` with per-binary memory enforcement (see D
 [Unit]
 Description=trail-hand - DPU network master agent
 After=network.target
-Before=trail-corral.service trail-gate.service trail-pen.service trail-path.service trail-brand.service trail-trough.service trail-latch.service
+Before=trail-corral.service trail-gate.service trail-pen.service trail-path.service trail-brand.service trail-horn.service trail-trough.service trail-latch.service
 
 [Service]
 Type=notify
@@ -973,7 +974,7 @@ instance_id = "boss-a"  # unique per instance, auto-generated if empty
 
 The BlueField-3 DPU provides 16GB of RAM shared between the embedded ARM OS, DOCA
 framework services, crypto offload buffers, and all Trail agent processes. The total
-memory allocation for all 8 Trail agent binaries under peak load must not exceed
+memory allocation for all 9 Trail agent binaries under peak load must not exceed
 **1GB**, leaving at minimum 20% headroom (approximately 3GB on a 16GB SoC) for the
 Linux kernel, DOCA runtime, OpenSSL/libcrypto page cache, OVS-related kernel
 structures, and tc-flower netlink buffers.
@@ -1078,12 +1079,12 @@ When a sub-agent's RSS crosses the `MemoryHigh` threshold (80% of budget):
 
 ### Validation
 
-Memory budgets are validated in CI via integration tests that run all 8 binaries
+Memory budgets are validated in CI via integration tests that run all 9 binaries
 simultaneously under simulated load (500 tenants, 2000 firewall rules per tenant for
 trail-gate) on an ARM64 runner. Assertions:
 
 - No individual binary exceeds its `MemoryMax` within 60 seconds of sustained load
-- Combined RSS of all 8 binaries remains below 1000MiB at p99
+- Combined RSS of all 9 binaries remains below 1000MiB at p99
 - Back-pressure activates correctly when synthetic memory pressure is injected
 
 Production metrics exported by trail-hand:
@@ -1422,7 +1423,7 @@ plugins:
 | `trail-dpu-{version}.arm64.deb` | arm64 | Internal apt repo |
 | `trail-dpu-{version}.arm64.rpm` | arm64 | Internal yum repo |
 
-The `trail-dpu` package contains all 8 binaries, their systemd units, default TOML configs under `/etc/trail/`, and a shared `trail-dpu.conf` tmpfiles.d entry.
+The `trail-dpu` package contains all 9 binaries, their systemd units, default TOML configs under `/etc/trail/`, and a shared `trail-dpu.conf` tmpfiles.d entry.
 
 ### Deployment Tiers
 
@@ -1715,8 +1716,8 @@ Phase 1 delivers a working end-to-end slice: control plane to DPU, with one full
 
 | Binary | Phase 1 Scope | Notes |
 |--------|--------------|-------|
-| `trail-boss` | Full control plane: ConnectRPC API, PostgreSQL state, embedded NATS pub/sub to DPU fleet, desired-state compilation, convergence tracking | amd64, Tier 2 |
-| `trail-hand` | Master agent on DPU: manages sub-agent lifecycle, Unix socket IPC multiplexer, health aggregation, NATS uplink to trail-boss, config distribution | arm64, BF3 |
+| `trail-boss` | Full control plane: ConnectRPC API, PostgreSQL state, embedded NATS (inter-boss coordination), intent compilation, convergence tracking | amd64, Tier 2 |
+| `trail-hand` | Master agent on DPU: manages sub-agent lifecycle, Unix socket IPC multiplexer, health aggregation, bidi gRPC stream to trail-boss, config distribution | arm64, BF3 |
 | `trail-corral` | VF/SF pool manager: allocates PCIe VFs, tracks NUMA affinity, binds VFs to tenants, reports capacity to trail-boss | arm64, sub-agent of trail-hand |
 | `trail-gate` | **Reference implementation sub-agent.** Firewall: programs per-VF L3/L4 ACL + connection tracking rules into eSwitch via tc-flower/netlink. Implements the full sub-agent contract. | arm64, sub-agent of trail-hand |
 | `trail-pen` | Not implemented. Future: per-VM stateful ACLs (security group rules) | Create from trail-gate template when staffed |
@@ -1726,7 +1727,7 @@ Phase 1 delivers a working end-to-end slice: control plane to DPU, with one full
 | `trail-trough` | Not implemented. Future: L4 DNAT/ECMP on eSwitch + Tier 3 LB health-check coordination | Create from trail-gate template when staffed |
 | `trail-latch` | Not implemented. Future: WireGuard tunnel data-plane, ZTNA auth | Create from trail-gate template when staffed |
 
-**Phase 1 exit criteria:** trail-boss pushes a firewall policy change over NATS, trail-hand receives it, dispatches to trail-gate over Unix socket IPC, trail-gate programs the eSwitch via tc-flower, reports actual state back up the chain, trail-boss confirms convergence. Tested on real BF3 hardware with a VF carrying tenant traffic.
+**Phase 1 exit criteria:** trail-boss pushes a firewall policy change over the bidi gRPC stream, trail-hand receives it, dispatches to trail-gate over Unix socket IPC, trail-gate programs the eSwitch via tc-flower, reports actual state back up the chain, trail-boss confirms convergence. Tested on real BF3 hardware with a VF carrying tenant traffic.
 
 **What we deliberately do NOT ship:** stub `cmd/` entries for unimplemented sub-agents. Stubs rot, give false confidence in CI ("all binaries build!"), and accumulate drift from the real contract. Instead, new sub-agents are created from scratch using trail-gate as the living template when an engineer is staffed to implement them.
 
@@ -1856,7 +1857,7 @@ When trail-hand starts (or restarts), it discovers sub-agents by scanning `/run/
 2. **Validate** — trail-hand checks that no two sub-agents claim the same pipeline stage. Conflicts are fatal.
 3. **Hydrate** — trail-hand immediately calls `HandleDesiredState` with the last-known desired state for each stage the sub-agent owns.
 4. **Health loop** — trail-hand calls `HealthCheck` every 5s. Three consecutive failures trigger sub-agent restart via systemd.
-5. **Steady state** — On each desired-state update from trail-boss (NATS), trail-hand routes it to the owning sub-agent via `HandleDesiredState`.
+5. **Steady state** — On each desired-state update from trail-boss (bidi gRPC stream), trail-hand routes it to the owning sub-agent via `HandleDesiredState`.
 
 **Startup ordering:** trail-hand starts first (systemd `Before=` dependency). Sub-agents start after and create their socket. trail-hand uses inotify on `/run/trail/` to detect new sockets without polling.
 
