@@ -14,17 +14,86 @@ Reference: follows `technicolor-haze-hypervisor` (herd) conventions exactly.
 
 Texas/pastoral theme. The trail boss leads the cattle drive; trail hands patrol sections.
 
-| Component | Binary | Meaning | Deploys To | Responsibilities |
-|-----------|--------|---------|------------|-----------------|
-| Network Manager | `trail-boss` | The trail boss leads the cattle drive | Server (amd64) | Control plane: tenant state, IPAM client, scheduling, HA coordination, public API (ConnectRPC) |
-| DPU Master Agent | `trail-hand` | Ranch hand — patrols one section | DPU (arm64) | Session to trail-boss, capability discovery, sub-agent lifecycle (systemd), IPC broker |
-| Interface Manager | `trail-corral` | Corral — where animals are penned for work | DPU (arm64) | VF/SF creation and teardown, link up/down, representor management, MTU/VLAN config |
-| Firewall sub-agent | `trail-gate` | Gate — controls what passes through | DPU (arm64) | L3/L4 tc-flower rules, SNAT/DNAT, NPTv6, conntrack offload |
-| Security Groups sub-agent | `trail-pen` | Pen — per-animal enclosure | DPU (arm64) | Per-VM stateful ACLs (security group rules → tc-flower) |
-| Overlay/routing sub-agent | `trail-path` | Path — routes connecting pastures | DPU (arm64) | VPC overlay (VXLAN/Geneve), route programming, VNI management |
-| DHCP sub-agent | `trail-brand` | Brand — marks identity | DPU (arm64) | DHCP server responses on VF representors, lease management |
-| Load Balancer sub-agent | `trail-trough` | Trough — shared resource, animals gather | DPU (arm64) — L4 only | L4 DNAT/ECMP rule programming on eSwitch. Health checks + backend selection driven by trail-boss. L7 (HTTP/TLS) requires dedicated VM — out of scope for Phase 1 |
-| Secure Access sub-agent | `trail-latch` | Latch — secure entry point | DPU (arm64) + Server (amd64) | DPU: WireGuard tunnel data-plane, packet filtering. Server: ZTNA auth (OIDC/cert validation), session management, policy decisions. Split binary — DPU agent + server-side controller |
+### DPU Sub-Agents (trail-hand managed, arm64)
+
+| Component | Binary | Meaning | Responsibilities |
+|-----------|--------|---------|-----------------|
+| DPU Orchestrator | `trail-boss` | The trail boss leads the cattle drive | Intent compilation from upstream services, per-DPU config push, convergence tracking, VF scheduling, recovery gating. Deploys on Tier 2 (amd64, K8s + systemd) |
+| DPU Master Agent | `trail-hand` | Ranch hand — patrols one section | Persistent bidi gRPC session to trail-boss, capability discovery, sub-agent lifecycle (systemd), IPC broker |
+| Interface Manager | `trail-corral` | Corral — where animals are penned for work | VF/SF creation and teardown, link up/down, representor management, MTU/VLAN config, Elastic/Floating IP assignment to interface |
+| Firewall + NAT + Steering | `trail-gate` | Gate — controls what passes through | NACL rules (stage 2), SNAT/DNAT (NAT Gateway data-plane), traffic steering to Tier 3 services (stage 5), conntrack offload. Shares netlink/tc-flower libs with trail-pen |
+| Security Groups | `trail-pen` | Pen — per-animal enclosure | Per-VM stateful ACLs (stage 3), connection tracking. Simplified subset — shares tc-flower libs with trail-gate but independently deployed |
+| Routing + Overlay | `trail-path` | Path — routes connecting pastures | VPC overlay (VXLAN/Geneve), VNI decap (stage 1), route table programming (stage 4). Routes fed from DHCP leases via trail-boss |
+| DHCP | `trail-brand` | Brand — marks identity | DHCP server responses on VF representors, lease management, triggers route updates in trail-path via trail-boss |
+| DNS | `trail-horn` | Horn — calls out across the range | Route53-style private DNS: per-VPC split-horizon resolution, DPU-local interception at 169.254.169.253, zone management, auto-registration from DHCP leases |
+| Load Balancer | `trail-trough` | Trough — shared resource, animals gather | Combined service: L4 DNAT/ECMP on DPU eSwitch + health-check coordination with Tier 3 LB VM. L7 requires dedicated VM |
+| Secure Access / VPN | `trail-latch` | Latch — secure entry point | DPU: WireGuard tunnel data-plane, packet filtering. Server (amd64): ZTNA auth, session management, policy decisions. Split binary |
+
+### Service Topology
+
+```
+┌─────────────────────── TIER 2: Control Plane (K8s, Blue) ──────────────────────────┐
+│                                                                                      │
+│  Tenant/VPC Controller ──┐                                                          │
+│  Gateway Controller ─────┤                                                          │
+│  IPAM Service ───────────┤── push intent ──► trail-boss (DPU Orchestrator)          │
+│  Elastic IP Service ─────┤                        │                                 │
+│  (others as needed) ─────┘                        │ push compiled config            │
+│                                                   ▼                                 │
+└───────────────────────────────────────────────────┼─────────────────────────────────┘
+                                                    │ bidi gRPC (agent dials out)
+┌─────────────────────── TIER 3: Shared Services (VMs, Green Rail B) ─────────────────┐
+│                                                                                      │
+│  Prism (Virtual Firewall) ── session offload via DPU Orchestrator                   │
+│  NAT Gateway VM ── session offload via DPU Orchestrator                             │
+│  Load Balancer VM ── session offload + health-checks (trail-trough L4 on DPU)       │
+│  DHCP Anchor VM (Kea) ── authoritative leases, notifies TVPC                       │
+│  DNS Anchor VM (CoreDNS) ── split-horizon resolution (trail-horn on DPU)            │
+│  Nexus (Secure Access VM) ── ZTNA controller (trail-latch on DPU)                   │
+│                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────── TIER 4: DPU (BlueField-3 ARM, arm64) ───────────────────────┐
+│                                                                                      │
+│  trail-hand (master agent) ◄── bidi stream ──► trail-boss                           │
+│       │                                                                              │
+│       ├── trail-corral (VF/SF lifecycle + EIP assignment)                           │
+│       ├── trail-gate  (NACL + NAT + steering → tc-flower)                           │
+│       ├── trail-pen   (Security Groups → tc-flower, shares libs with gate)          │
+│       ├── trail-path  (VNI decap + routing → tc-flower)                             │
+│       ├── trail-brand (DHCP responses on VF reps)                                   │
+│       ├── trail-horn  (DNS interception + resolution)                               │
+│       ├── trail-trough (L4 LB DNAT/ECMP on eSwitch)                                │
+│       └── trail-latch (WireGuard tunnels)                                           │
+│                                                                                      │
+│  Session Offload Daemon (separate, not trail) ── high-frequency per-flow entries    │
+│                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Upstream Services (push intent TO trail-boss)
+
+These are Tier 2 controllers — they never touch DPU hardware directly.
+
+| Upstream Service | Pushes Stages | Notes |
+|-----------------|---------------|-------|
+| Tenant/VPC Controller (TVPC) | 2 (NACL), 3 (SG), 4 (Routing) | VPC/subnet CRUD + intent push. "Virtual service" in the sense that it defines tenant perimeter; real in that it produces hardware-programmed eSwitch entries via trail-boss |
+| Gateway Controller | 5 (Steering) | Programs steering rules for NAT/LB/Prism/Nexus/DNS; manages Tier 3 VM lifecycle |
+| IPAM Service | 1 (Decap/VNI) | VNI allocation, IP pool management, feeds trail-corral EIP assignments via trail-boss |
+| Elastic IP Service | 4 (EIP routes) | Stable public IPs — trail-boss reserves from inventory, trail-corral assigns to interface |
+| Prism (via Gateway Controller) | 5, 6 | Steering to Prism VM + session offload back |
+| NAT Gateway (via Gateway Controller) | 5, 6 | Steering to NAT VM + session offload back |
+| Load Balancer (via Gateway Controller) | 5, 6 | Steering to LB VM + trail-trough L4 rules |
+| Private DNS (via Gateway Controller) | 5 | Steering DNS queries to anchor; trail-horn handles DPU-local resolution |
+
+### Shared Libraries (between sub-agents)
+
+| Package | Used By | Why Shared |
+|---------|---------|-----------|
+| `internal/netlink/flower.go` | trail-gate, trail-pen | Both program tc-flower rules; trail-pen is simplified SG-only subset |
+| `internal/netlink/iface.go` | trail-corral | VF/SF creation, link management |
+| `internal/subagent/reconciler/` | ALL sub-agents | Desired → actual → delta → apply loop |
+| `internal/subagent/ipc/` | ALL sub-agents + trail-hand | Unix socket communication |
 
 ---
 
@@ -47,7 +116,9 @@ technicolor-haze-trail/
 │   │   └── main.go
 │   ├── trail-brand/               ← Sub-agent: DHCP responses (arm64)
 │   │   └── main.go
-│   ├── trail-trough/              ← Sub-agent: L4/L7 load balancer (arm64)
+│   ├── trail-horn/                ← Sub-agent: Private DNS (Route53-style, arm64)
+│   │   └── main.go
+│   ├── trail-trough/              ← Sub-agent: L4 load balancer (arm64)
 │   │   └── main.go
 │   └── trail-latch/               ← Sub-agent: VPN/ZTNA (arm64)
 │       └── main.go
@@ -917,11 +988,12 @@ structures, and tc-flower netlink buffers.
 | trail-pen | Security group evaluation and flow caching | 96MiB | 76MiB | 96MiB | ~34MiB |
 | trail-path | Overlay routing, VNI lookup table | 64MiB | 51MiB | 64MiB | ~24MiB |
 | trail-brand | DHCP lease state, minimal footprint | 32MiB | 25MiB | 32MiB | ~14MiB |
+| trail-horn | DNS zone cache, query routing | 48MiB | 38MiB | 48MiB | ~20MiB |
 | trail-trough | Load-balancer rule sets and health state | 48MiB | 38MiB | 48MiB | ~20MiB |
 | trail-latch | WireGuard tunnel state and key material | 48MiB | 38MiB | 48MiB | ~18MiB |
-| **Total** | | **528MiB** | | **528MiB** | **~198MiB** |
+| **Total** | | **576MiB** | | **576MiB** | **~218MiB** |
 
-The 528MiB total leaves 472MiB of the 1GB envelope unallocated, providing burst
+The 576MiB total leaves 424MiB of the 1GB envelope unallocated, providing burst
 capacity during rule-set compilation spikes and protecting against GC pressure
 cascades across binaries.
 
@@ -1039,7 +1111,7 @@ build-boss:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$(LDFLAGS) -s -w" \
 		-o dist/trail-boss ./cmd/trail-boss/
 
-build-dpu: build-hand build-corral build-gate build-pen build-path build-brand build-trough build-latch
+build-dpu: build-hand build-corral build-gate build-pen build-path build-brand build-horn build-trough build-latch
 
 build-hand:
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$(LDFLAGS) -s -w" \
@@ -1110,6 +1182,8 @@ contents:
     dst: /usr/bin/trail-path
   - src: dist/arm64/trail-brand
     dst: /usr/bin/trail-brand
+  - src: dist/arm64/trail-horn
+    dst: /usr/bin/trail-horn
   - src: dist/arm64/trail-trough
     dst: /usr/bin/trail-trough
   - src: dist/arm64/trail-latch
@@ -1189,7 +1263,7 @@ jobs:
 
 | Package | Used By |
 |---------|---------|
-| `internal/netlink/` | trail-corral, trail-gate, trail-pen, trail-path, trail-brand, trail-trough |
+| `internal/netlink/` | trail-corral, trail-gate, trail-pen, trail-path, trail-brand, trail-horn, trail-trough |
 | `internal/subagent/ipc/` | ALL sub-agents + trail-hand |
 | `internal/subagent/reconciler/` | ALL sub-agents |
 | `internal/obs/` | ALL binaries |
@@ -1267,7 +1341,7 @@ rules:
   scope-enum:
     - 2
     - always
-    - [boss, dpu, hand, corral, gate, pen, path, brand, trough, latch, proto, ci, docs]
+    - [boss, dpu, hand, corral, gate, pen, path, brand, horn, trough, latch, proto, ci, docs]
   scope-empty:
     - 2
     - never
@@ -1316,6 +1390,7 @@ plugins:
         - { scope: "pen", release: "patch" }
         - { scope: "path", release: "patch" }
         - { scope: "brand", release: "patch" }
+        - { scope: "horn", release: "patch" }
         - { scope: "trough", release: "patch" }
         - { scope: "latch", release: "patch" }
         - { type: "feat", release: "minor" }
@@ -1646,8 +1721,9 @@ Phase 1 delivers a working end-to-end slice: control plane to DPU, with one full
 | `trail-gate` | **Reference implementation sub-agent.** Firewall: programs per-VF L3/L4 ACL + connection tracking rules into eSwitch via tc-flower/netlink. Implements the full sub-agent contract. | arm64, sub-agent of trail-hand |
 | `trail-pen` | Not implemented. Future: per-VM stateful ACLs (security group rules) | Create from trail-gate template when staffed |
 | `trail-path` | Not implemented. Future: VPC overlay (VXLAN/Geneve), route programming, VNI management | Create from trail-gate template when staffed |
-| `trail-brand` | Not implemented. Future: DHCP server responses on VF representors | Create from trail-gate template when staffed |
-| `trail-trough` | Not implemented. Future: L4 DNAT/ECMP rule programming on eSwitch | Create from trail-gate template when staffed |
+| `trail-brand` | Not implemented. Future: DHCP server responses on VF representors, lease management | Create from trail-gate template when staffed |
+| `trail-horn` | Not implemented. Future: Route53-style private DNS — per-VPC split-horizon, auto-registration | Create from trail-gate template when staffed |
+| `trail-trough` | Not implemented. Future: L4 DNAT/ECMP on eSwitch + Tier 3 LB health-check coordination | Create from trail-gate template when staffed |
 | `trail-latch` | Not implemented. Future: WireGuard tunnel data-plane, ZTNA auth | Create from trail-gate template when staffed |
 
 **Phase 1 exit criteria:** trail-boss pushes a firewall policy change over NATS, trail-hand receives it, dispatches to trail-gate over Unix socket IPC, trail-gate programs the eSwitch via tc-flower, reports actual state back up the chain, trail-boss confirms convergence. Tested on real BF3 hardware with a VF carrying tenant traffic.
